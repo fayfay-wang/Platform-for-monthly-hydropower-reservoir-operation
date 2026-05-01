@@ -1,0 +1,8 @@
+"dead_level": 1166,  # Dead water level (m)
+"normal_level": 1240,  # Normal water level (m)
+"initial_level": 1240,  # Initial water level (m)
+"max_turbine_discharge": 2340,  # Outflow capacity of turbines (m3/s)
+"max_power": 4200000,  # Installed capacity (kW)
+"firm_power": 1854000  # Firm output of turbines (kW)
+"power_coefficient": 8.5,  # Power coefficient
+"delta_t_days": 30.4

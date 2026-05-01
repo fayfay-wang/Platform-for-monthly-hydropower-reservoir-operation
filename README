@@ -1,0 +1,12 @@
+### Basic installation
+
+```bash
+conda create -n reservoir_benchmark python=3.11 -y
+conda activate reservoir_benchmark
+python -m pip install -e .
+This installs the basic dependencies required by DP, SDP, ISO-SURF, data processing, evaluation, and visualization modules.
+
+
+If you want to run DQN-based experiments, install the optional DQN dependencies:
+python -m pip install -e ".[dqn]"
+python -m pip install -e ".[dqn]"
