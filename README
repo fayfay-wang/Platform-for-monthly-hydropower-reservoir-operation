@@ -1,12 +1,96 @@
-### Basic installation
+your-repo/
+├─ README.md
+├─ LICENSE
+├─ pyproject.toml
+├─ .gitignore
+├─ src/
+│  └─ reservoir_benchmark/
+│     ├─ __init__.py
+│     ├─ shared/
+│     │  ├─ __init__.py
+│     │  └─ reservoir_model.py
+│     ├─ policy_generation/
+│     │  ├─ __init__.py
+│     │  └─ dp/
+│     │    ├─ __init__.py
+│     │    └─  dp_solver.py
+│     │  ├─ sdp/
+│     │    ├─ __init__.py
+│     │    ├─  sdp_solver.py
+│     │    └─  sdp_runner.py
+│     │  ├─ iso_surf/
+│     │    ├─ __init__.py
+│     │    ├─  iso_preprocessor.py
+│     │    └─  iso_surf_runner.py
+│     │  └─ dqn/
+│     ├─ evaluation/
+│     │  ├─ __init__.py
+│     │  └─ dp/
+│     │    ├─ __init__.py
+│     │    └─ dp_eval.py
+│     │  ├─ sdp/
+│     │    ├─ __init__.py
+│     │    └─ sdp_eval.py
+│     │  ├─ iso_surf/
+│     │    ├─ __init__.py
+│     │    └─ iso_surf_eval.py
+│     │  └─ dqn/
+│     │    ├─ __init__.py
+│     │    └─ dqn_eval.py
+│     └─ visualization/
+│        ├─ __init__.py
+│        ├─ overall_visualization.py
+│        └─ scenario_visualization.py
+├─ data/
+│  ├─ level_storage_curve.csv
+│  ├─ tailwater_discharge_curve.csv
+│  ├─ SynMonthlyInflow_train.xlsx
+│  ├─ SynMonthlyInflow_evaluation.xlsx
+│  ├─ penalty_settings.yaml
+│  └─ reservoir_settings.txt
+├─ scripts/
+│  ├─ run_policy_generation.py
+│  ├─ run_evaluation.py
+│  └─ run_visualization.py
+└─ outputs/
+│  ├─ policy_generation/
+│    ├─ sdp/
+│    │  ├─ preprocessed/
+│    │  │  └─ sdp_inflow_intervals_detailed.csv
+│    │  └─ policy/
+│    │     └─ sdp_train_lambda_{value}.xlsx
+│    ├─ iso_surf/
+│    │  ├─ preprocessed/
+│    │  │  └─ iso_upstream_dp_train_lambda_{value}.csv
+│    │  └─ policy/
+│    │     └─ iso_surf_train_lambda_{value}.pkl
+│    └─ dqn/
+│    │  └─ policy/
+│    │     └─ dqn_train_lambda_{value}.pth
+│
+│ ├─ evaluation/
+│    ├─ dp/
+│    │  └─  dp_eval_lambda_{value}.csv
+│    ├─ sdp/
+│    │  └─  sdp_eval_lambda_{value}.csv
+│    ├─ iso_surf/
+│    │  └─  iso_surf_eval_lambda_{value}.csv
+│    └─ dqn/
+│    │  └─  dqn_eval_lambda_{value}.csv
+   └─ visualization/
 
-```bash
-conda create -n reservoir_benchmark python=3.11 -y
-conda activate reservoir_benchmark
-python -m pip install -e .
-This installs the basic dependencies required by DP, SDP, ISO-SURF, data processing, evaluation, and visualization modules.
+The repository is organized into shared model definitions, policy generation modules, evaluation routines, visualization tools, and run scripts. 
+Specifically, \texttt{data/} stores reservoir characteristics, rating curves, inflow datasets, and penalty settings; 
+\texttt{src/reservoir\_benchmark/shared/} contains the common reservoir model; 
+\texttt{src/reservoir\_benchmark/policy\_generation/} implements four scheduling methods under \texttt{dp/}, \texttt{sdp/}, \texttt{iso\_surf/}, and \texttt{dqn/}; 
+\texttt{src/reservoir\_benchmark/evaluation/} provides the corresponding evaluation runners; 
+\texttt{outputs/policy\_generation/} and \texttt{outputs/evaluation/} store trained artifacts and assessment results; 
+and \texttt{src/reservoir\_benchmark/visualization/} together with \texttt{scripts/run\_visualization.py} generates manuscript figures.
 
+Input files are provided in \texttt{.csv}, \texttt{.xlsx}, \texttt{.txt}, and \texttt{.yaml} formats. 
+Output files include result tables in \texttt{.csv}/\texttt{.xlsx}, trained DQN model checkpoints (e.g., \texttt{.pth}), preprocessed data, and publication figures in PDF format. 
+Example input datasets required to run the benchmark (excluding inflow series) are included in the repository.
 
-If you want to run DQN-based experiments, install the optional DQN dependencies:
-python -m pip install -e ".[dqn]"
-python -m pip install -e ".[dqn]"
+The main figures and tables reported in this paper can be reproduced using the visualization scripts under \texttt{src/reservoir\_benchmark/visualization/} (launched via \texttt{scripts/run\_visualization.py}) and the instructions documented in the repository README. 
+The mapping between manuscript figures/tables and scripts is explicitly documented in \texttt{README.md}. 
+The scripts \texttt{scripts/run\_policy\_generation.py} and \texttt{scripts/run\_evaluation.py} reproduce the method sweeps and the standardized evaluation workflow.
