@@ -74,7 +74,7 @@ def save_dp_results(
     print(f"Saved DP results: {csv_path.resolve()}")
 
 
-def main_dp_test() -> None:
+def main_dp_eval() -> None:
     """
     Run DP for all lambda values defined in data/penalty_settings.yaml.
     """
