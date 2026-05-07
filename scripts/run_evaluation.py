@@ -11,10 +11,10 @@ The purpose of this script is to keep executable evaluation workflows separate
 from reusable library modules.
 """
 
-from reservoir_benchmark.evaluation.dp.dp_test import main_dp_test
-from reservoir_benchmark.evaluation.sdp.sdp_test import main_sdp_test
-from reservoir_benchmark.evaluation.iso_surf.iso_surf_test import main_iso_surf_test
-from reservoir_benchmark.evaluation.dqn.dqn_test import main_dqn_test
+from reservoir_benchmark.evaluation.dp.dp_eval import main_dp_eval
+from reservoir_benchmark.evaluation.sdp.sdp_eval import main_sdp_eval
+from reservoir_benchmark.evaluation.iso_surf.iso_surf_eval import main_iso_surf_eval
+from reservoir_benchmark.evaluation.dqn.dqn_eval import main_dqn_eval
 
 
 def main() -> None:
@@ -22,22 +22,22 @@ def main() -> None:
         print("=" * 80)
         print("Running DP evaluation...")
         print("=" * 80)
-        main_dp_test()
+        main_dp_eval()
 
         print("\n" + "=" * 80)
         print("Running SDP evaluation...")
         print("=" * 80)
-        main_sdp_test()
+        main_sdp_eval()
 
         print("\n" + "=" * 80)
         print("Running ISO-SURF evaluation...")
         print("=" * 80)
-        main_iso_surf_test()
+        main_iso_surf_eval()
 
         print("\n" + "=" * 80)
         print("Running DQN evaluation...")
         print("=" * 80)
-        main_dqn_test()
+        main_dqn_eval()
 
         print("\n" + "=" * 80)
         print("All evaluation tasks completed.")
