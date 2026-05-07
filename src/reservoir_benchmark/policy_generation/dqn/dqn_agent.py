@@ -411,7 +411,7 @@ class DQNAgent:
             return False
 
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
             self.eval_net.load_state_dict(checkpoint["eval_net_state_dict"])
             self.target_net.load_state_dict(checkpoint["target_net_state_dict"])
