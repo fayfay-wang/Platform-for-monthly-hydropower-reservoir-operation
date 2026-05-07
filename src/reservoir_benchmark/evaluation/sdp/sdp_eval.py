@@ -382,7 +382,7 @@ class SDPReservoirSimulator:
         print(f"Elapsed time: {end_t - start_t:.3f} seconds")
 
 
-def main_sdp_test() -> None:
+def main_sdp_eval() -> None:
     """
     Main entry point for SDP evaluation.
     """
@@ -408,4 +408,4 @@ def main_sdp_test() -> None:
 
 
 if __name__ == "__main__":
-    main_sdp_test()
+    main_sdp_eval()
