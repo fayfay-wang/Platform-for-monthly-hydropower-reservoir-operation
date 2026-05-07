@@ -278,9 +278,9 @@ def run_evaluation():
         )
 
 
-def main_dqn_test() -> None:
+def main_dqn_eval() -> None:
     run_evaluation()
 
 
 if __name__ == "__main__":
-    main_dqn_test()
+    main_dqn_eval()
