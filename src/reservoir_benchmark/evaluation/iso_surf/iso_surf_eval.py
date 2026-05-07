@@ -274,10 +274,10 @@ class ISOReservoirSimulator:
                 )
 
 
-def main_iso_surf_test() -> None:
+def main_iso_surf_eval() -> None:
     simulator = ISOReservoirSimulator()
     simulator.run_all()
 
 
 if __name__ == "__main__":
-    main_iso_surf_test()
+    main_iso_surf_eval()
