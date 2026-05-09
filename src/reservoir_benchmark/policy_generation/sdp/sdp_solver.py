@@ -177,30 +177,26 @@ class ReservoirOperation:
 
     def _check_convergence(self, current_decisions: np.ndarray):
         """
-        Check whether January decisions have converged for all states
-        and inflow classes.
-
+        Check whether the full annual decision matrix has converged.
+    
+        The convergence criterion is based on the maximum absolute difference
+        between the current and previous decision matrices across all months,
+        water-level states, and inflow classes.
+    
         Returns:
             (converged, max_difference)
         """
         # No convergence check is possible on the first annual iteration
-        # because there is no previous January decision table yet.
+        # because there is no previous decision table yet.
         if self.history["prev_decisions"] is None:
             return False, np.inf
-
+    
         prev_decisions = self.history["prev_decisions"]
-
-        # Convergence is judged only from January decisions across all water-
-        # level states and inflow classes, which is standard for cyclic SDP.
-        max_diff = 0.0
-        for state in range(len(self.levels)):
-            for flow_idx in range(self.n_flows):
-                diff = abs(
-                    current_decisions[0, state, flow_idx]
-                    - prev_decisions[0, state, flow_idx]
-                )
-                max_diff = max(max_diff, diff)
-
+    
+        # Check the whole annual policy:
+        # dimensions = [month, water-level state, inflow class]
+        max_diff = np.max(np.abs(current_decisions - prev_decisions))
+    
         converged = max_diff <= self.config["threshold"]
         return converged, max_diff
 
