@@ -71,7 +71,7 @@ PANEL_FACE_COLORS = [
 
 RELIABILITY_DRY_QUANTILE = 0.2
 RELIABILITY_WET_QUANTILE = 0.8
-RELIABILITY_FLOOR_PCT = 90.0
+RELIABILITY_FLOOR_PCT = 80.0
 
 
 def infer_year_month_from_month_index(month_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
@@ -147,46 +147,60 @@ def collect_eval_candidates(algo_label: str, eval_dir: Path, firm_power: float) 
     return records
 
 
-def select_best_eval_file_combination(outputs_dir: Path, firm_power: float, reliability_floor_pct: float = RELIABILITY_FLOOR_PCT) -> Dict[str, Path]:
-    """
-    Select one evaluation CSV per algorithm using the following rule:
-
-    1) prefer combinations where every algorithm has reliability >= reliability_floor_pct;
-    2) among feasible combinations, choose the one with the smallest reliability variance;
-    3) break ties using the smallest reliability range, then the smallest sum of lambdas.
-
-    If no feasible combination satisfies the reliability floor, the function falls back
-    to all available combinations and still chooses the one with the smallest
-    reliability variance.
-    """
-    candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
-    for algo_label, algo_dir_name in ALGO_DIR_MAP.items():
-        eval_dir = outputs_dir / "evaluation" / algo_dir_name
-        candidate_map[algo_label] = collect_eval_candidates(algo_label, eval_dir, firm_power=firm_power)
-
-    algo_labels = list(ALGO_ORDER)
-    all_products = product(*(candidate_map[algo] for algo in algo_labels))
-
-    feasible: List[Tuple[float, float, float, Dict[str, Path]]] = []
-    fallback: List[Tuple[float, float, float, Dict[str, Path]]] = []
-
-    for combo in all_products:
-        reliabilities = np.array([item[2] for item in combo], dtype=float)
-        lambdas = np.array([item[1] for item in combo], dtype=float)
-        selected = {algo_labels[i]: combo[i][0] for i in range(len(algo_labels))}
-
-        variance = float(np.var(reliabilities))
-        reliability_range = float(np.max(reliabilities) - np.min(reliabilities))
-        lambda_sum = float(np.sum(lambdas))
-        score = (variance, reliability_range, lambda_sum)
-
-        fallback.append((score[0], score[1], score[2], selected))
-        if np.all(reliabilities >= reliability_floor_pct):
-            feasible.append((score[0], score[1], score[2], selected))
-
-    pool = feasible if feasible else fallback
-    best = min(pool, key=lambda item: (item[0], item[1], item[2]))
-    return best[3]
+  def select_best_eval_file_combination(outputs_dir: Path, firm_power: float, reliability_floor_pct: float = RELIABILITY_FLOOR_PCT) -> Dict[str, Path]:
+      """
+      Select one evaluation CSV per algorithm using a strict reliability floor.
+  
+      Selection rule:
+      1) discard every candidate whose reliability is below reliability_floor_pct;
+      2) among the remaining cross-algorithm combinations, choose the one with the
+         smallest reliability variance;
+      3) break ties using the smallest reliability range, then the smallest sum of
+         lambda values.
+  
+      Unlike the previous version, this function does not fall back to
+      lower-reliability scenarios. If any algorithm has no candidate with
+      reliability >= reliability_floor_pct, it raises a ValueError.
+      """
+      candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
+  
+      for algo_label, algo_dir_name in ALGO_DIR_MAP.items():
+          eval_dir = outputs_dir / "evaluation" / algo_dir_name
+          raw_candidates = collect_eval_candidates(algo_label, eval_dir, firm_power=firm_power)
+          valid_candidates = [
+              item for item in raw_candidates
+              if item[2] >= reliability_floor_pct
+          ]
+  
+          if not valid_candidates:
+              best_candidate = max(raw_candidates, key=lambda item: item[2])
+              raise ValueError(
+                  f"No evaluation CSV for {algo_label} satisfies the reliability floor "
+                  f">= {reliability_floor_pct:.2f}%. "
+                  f"Best available file is {best_candidate[0].name} "
+                  f"with reliability = {best_candidate[2]:.2f}%."
+              )
+  
+          candidate_map[algo_label] = valid_candidates
+  
+      algo_labels = list(ALGO_ORDER)
+      all_products = product(*(candidate_map[algo] for algo in algo_labels))
+  
+      feasible: List[Tuple[float, float, float, Dict[str, Path]]] = []
+  
+      for combo in all_products:
+          reliabilities = np.array([item[2] for item in combo], dtype=float)
+          lambdas = np.array([item[1] for item in combo], dtype=float)
+          selected = {algo_labels[i]: combo[i][0] for i in range(len(algo_labels))}
+  
+          variance = float(np.var(reliabilities))
+          reliability_range = float(np.max(reliabilities) - np.min(reliabilities))
+          lambda_sum = float(np.sum(lambdas))
+  
+          feasible.append((variance, reliability_range, lambda_sum, selected))
+  
+      best = min(feasible, key=lambda item: (item[0], item[1], item[2]))
+      return best[3]
 
 
 def load_single_result(algo_label: str, csv_path: Path) -> pd.DataFrame:
