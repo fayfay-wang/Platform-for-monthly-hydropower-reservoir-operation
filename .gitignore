@@ -28,6 +28,8 @@ Thumbs.db
 
 # Runtime outputs and generated results
 outputs/
+docs/_build/
+docs_build/
 
 # Large trained model files
 *.pth

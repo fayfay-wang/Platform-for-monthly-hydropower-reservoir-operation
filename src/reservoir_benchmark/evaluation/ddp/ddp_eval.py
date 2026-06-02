@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from reservoir_benchmark.policy_generation.dp.dp_solver import ReservoirOperation
+from reservoir_benchmark.policy_generation.ddp.ddp_solver import ReservoirOperation
 from reservoir_benchmark.shared.io_utils import (
     load_monthly_inflows_from_excel,
     load_penalty_candidates,
@@ -48,12 +48,12 @@ def save_dp_results(
     Save monthly DP results as a single CSV file.
 
     File name pattern:
-        dp_eval_lambda_{lam}.csv
+        ddp_eval_lambda_{lam}.csv
     """
     result_dir.mkdir(parents=True, exist_ok=True)
 
     lam_str = format_lambda_for_filename(lam)
-    csv_filename = f"dp_eval_lambda_{lam_str}.csv"
+    csv_filename = f"ddp_eval_lambda_{lam_str}.csv"
     csv_path = result_dir / csv_filename
 
     monthly_results = pd.DataFrame(
@@ -71,15 +71,15 @@ def save_dp_results(
     )
 
     monthly_results.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"Saved DP results: {csv_path.resolve()}")
+    print(f"Saved DDP results: {csv_path.resolve()}")
 
 
-def main_dp_eval() -> None:
+def main_ddp_eval() -> None:
     """
     Run DP for all lambda values defined in data/penalty_settings.yaml.
     """
     data_dir = get_data_dir()
-    result_dir = get_outputs_dir() / "evaluation" / "dp"
+    result_dir = get_outputs_dir() / "evaluation" / "ddp"
 
     inflow_path = data_dir / "SynMonthlyInflow_evaluation.xlsx"
     penalty_settings_path = data_dir / "penalty_settings.yaml"
@@ -87,7 +87,7 @@ def main_dp_eval() -> None:
     inflows_df = load_monthly_inflows_from_excel(inflow_path)
     inflows = inflows_df.values
 
-    penalty_lambdas = load_penalty_candidates(penalty_settings_path, "dp")
+    penalty_lambdas = load_penalty_candidates(penalty_settings_path, "ddp")
 
     reservoir = SharedReservoirModel(data_dir=data_dir)
     dp_solver = ReservoirOperation(reservoir=reservoir, inflows=inflows)

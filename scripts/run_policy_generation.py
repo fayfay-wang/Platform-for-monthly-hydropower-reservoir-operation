@@ -17,7 +17,7 @@ from reservoir_benchmark.policy_generation.dqn.dqn_runner import main_dqn
 
 def main() -> None:
     try:
-        print("=" * 80)
+        # print("=" * 80)
         print("Running SDP policy generation...")
         print("=" * 80)
         main_sdp()

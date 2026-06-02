@@ -34,7 +34,7 @@ from reservoir_benchmark.shared.reservoir_model import SharedReservoirModel
 # Keep directory names unchanged, but use publication-friendly labels.
 ALGO_ORDER = ["DDP", "SDP", "ISO-SURF", "DQN"]
 ALGO_DIR_TO_LABEL = {
-    "dp": "DDP",
+    "ddp": "DDP",
     "sdp": "SDP",
     "iso_surf": "ISO-SURF",
     "dqn": "DQN",

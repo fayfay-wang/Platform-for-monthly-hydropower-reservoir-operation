@@ -11,7 +11,7 @@ The purpose of this script is to keep executable evaluation workflows separate
 from reusable library modules.
 """
 
-from reservoir_benchmark.evaluation.dp.dp_eval import main_dp_eval
+from reservoir_benchmark.evaluation.ddp.ddp_eval import main_ddp_eval
 from reservoir_benchmark.evaluation.sdp.sdp_eval import main_sdp_eval
 from reservoir_benchmark.evaluation.iso_surf.iso_surf_eval import main_iso_surf_eval
 from reservoir_benchmark.evaluation.dqn.dqn_eval import main_dqn_eval
@@ -20,9 +20,9 @@ from reservoir_benchmark.evaluation.dqn.dqn_eval import main_dqn_eval
 def main() -> None:
     try:
         print("=" * 80)
-        print("Running DP evaluation...")
+        print("Running DDP evaluation...")
         print("=" * 80)
-        main_dp_eval()
+        main_ddp_eval()
 
         print("\n" + "=" * 80)
         print("Running SDP evaluation...")

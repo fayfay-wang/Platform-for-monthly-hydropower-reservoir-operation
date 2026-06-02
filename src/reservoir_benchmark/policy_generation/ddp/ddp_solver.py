@@ -2,7 +2,7 @@
 Deterministic dynamic programming solver module for the unified reservoir
 operation framework.
 
-This module implements the core deterministic dynamic programming (DP)
+This module implements the core deterministic dynamic programming (DDP)
 optimization logic for single-reservoir operation, including:
 1) one-step reservoir transition calculation,
 2) hydraulic head and hydropower computation under shared reservoir physics,
@@ -10,7 +10,7 @@ optimization logic for single-reservoir operation, including:
 4) backward Bellman recursion over discretized water levels, and
 5) forward simulation of the optimal trajectory.
 
-The purpose of this module is to isolate the algorithmic core of DP from
+The purpose of this module is to isolate the algorithmic core of DDP from
 project-specific path handling, file input/output, and script-level execution,
 so that the solver remains focused on optimization logic and can be reused
 cleanly within the unified framework.
@@ -23,9 +23,9 @@ import numpy as np
 
 class ReservoirOperation:
     """
-    Deterministic dynamic programming (DP) for single-reservoir operation.
+    Deterministic dynamic programming (DDP) for single-reservoir operation.
 
-    This solver only contains the DP logic itself.
+    This solver only contains the DDP logic itself.
     It does not handle project paths, file reading, or output writing.
     """
 
@@ -173,7 +173,7 @@ class ReservoirOperation:
                 target_level,
             )
 
-        # Return one-step operation results for DP recursion or forward simulation.
+        # Return one-step operation results for DDP recursion or forward simulation.
         return (
             power_kw,
             total_discharge,
@@ -207,7 +207,7 @@ class ReservoirOperation:
         n_states = len(self.levels)
 
         # Flatten the inflow matrix [years, 12] into one deterministic monthly
-        # inflow sequence so the DP can be solved over a single finite horizon.
+        # inflow sequence so the DDP can be solved over a single finite horizon.
         inflows = self.inflows.flatten()
 
         # value_function[t, state] stores the maximum cumulative value from stage t
@@ -222,7 +222,7 @@ class ReservoirOperation:
         # when the current state is the given water-level state.
         decisions = np.zeros((months_per_year, n_states))
 
-        # Backward DP recursion:
+        # Backward DDP recursion:
         # evaluate stages from the end of the horizon back to the beginning.
         for t in reversed(range(months_per_year)):
             for state in range(n_states):
@@ -300,10 +300,8 @@ class ReservoirOperation:
         hours = self.delta_t_days * 24.0
 
         for t in range(months_per_year):
-            # Record the current level before applying the stage decision.
-            optimal_levels.append(current_level)
-
             next_level = decisions[t, current_state]
+
             (
                 power_kw,
                 total_discharge,
@@ -314,19 +312,22 @@ class ReservoirOperation:
                 storage_current,
             ) = self.calculate_operation(current_level, next_level, inflows[t])
 
-            # Record the realized one-step operation results under the optimal policy.
-            optimal_storages.append(storage_current)
+            # Save end-of-period state for standardized outputs.
+            storage_final = self.reservoir.calculate_storage(final_level)
+
+            optimal_levels.append(final_level)
+            optimal_storages.append(storage_final)
+
             optimal_powers.append(power_kw)
             optimal_electricity.append(power_kw * hours / 1e6)
             optimal_discharges.append(total_discharge)
             optimal_turbine_flows.append(turbine_discharge)
             optimal_spill_flows.append(spill_discharge)
 
-            # Move to the next state for the following stage.
             current_level = final_level
             current_state = np.argmin(np.abs(self.levels - current_level))
 
-        # Return both the DP solution objects and the forward-simulated optimal
+        # Return both the DDP solution objects and the forward-simulated optimal
         # trajectory for downstream saving, evaluation, or plotting.
         return (
             value_function,
