@@ -11,19 +11,14 @@ algorithm evaluation CSV files, including:
 
 Design choices
 --------------
-- The script reads only the standardized evaluation results under
+- The script reads standardized evaluation results under
   outputs/evaluation/{algorithm}.
-- Because interactive file selection has been removed, the script automatically
-  selects one evaluation CSV for each algorithm by optimizing the consistency of
-  month-based reliability across algorithms.
-- The preferred combination is the one in which all algorithms satisfy the
-  reliability floor (default: 90%) and the variance of the four reliability
-  values is minimized.
-- If multiple combinations are tied, the script further prefers the one with
-  the smallest reliability range and then the smallest sum of lambda values.
-- If no combination satisfies the reliability floor for all algorithms, the
-  script falls back to all available combinations and still chooses the one with
-  the smallest reliability variance.
+- One evaluation CSV is selected for each algorithm through an adaptive
+  reliability candidate pool.
+- Candidate pools are filtered by reliability coverage rules when enough files
+  satisfy the corresponding reliability floor for every algorithm.
+- Candidate combinations are ranked by reliability target proximity,
+  cross-algorithm reliability consistency, and lambda parsimony.
 - The visualization outputs are saved under outputs/visualization.
 """
 
@@ -71,13 +66,15 @@ PANEL_FACE_COLORS = [
 
 RELIABILITY_DRY_QUANTILE = 0.2
 RELIABILITY_WET_QUANTILE = 0.8
-# Preferred floor for selecting high-reliability baseline scenarios.
-# The script first tries to select candidates with reliability >= 85%.
-RELIABILITY_FLOOR_PCT = 85.0
 
-# If at least one algorithm has no candidate >= 85%, fall back to this lower
-# floor rather than silently selecting very low-reliability cases.
-RELIABILITY_FALLBACK_FLOOR_PCT = 80.0
+# Adaptive candidate-pool rules: (reliability floor %, minimum candidate ratio).
+RELIABILITY_FLOOR_RULES: List[Tuple[float, float]] = [
+    (80.0, 0.40),
+    (60.0, 0.50),
+]
+
+# Target reliability is set slightly above the active floor when a floor is used.
+TARGET_RELIABILITY_MARGIN_PCT = 5.0
 
 
 def infer_year_month_from_month_index(month_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
@@ -153,68 +150,101 @@ def collect_eval_candidates(algo_label: str, eval_dir: Path, firm_power: float) 
     return records
 
 
+def choose_adaptive_reliability_floor(
+    raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
+    floor_rules: List[Tuple[float, float]],
+) -> Tuple[float | None, Dict[float, Dict[str, float]]]:
+    """
+    Choose a reliability floor according to candidate availability.
+
+    For each reliability floor, the share of candidates satisfying the floor is
+    computed separately for each algorithm. A floor is activated only when every
+    algorithm meets the required candidate ratio and has at least one valid file.
+    """
+    ratio_record: Dict[float, Dict[str, float]] = {}
+
+    for floor_pct, min_ratio in floor_rules:
+        ratios: Dict[str, float] = {}
+        floor_is_available = True
+
+        for algo_label in ALGO_ORDER:
+            candidates = raw_candidate_map[algo_label]
+            n_total = len(candidates)
+            n_valid = sum(1 for item in candidates if item[2] >= floor_pct)
+            ratio = n_valid / n_total if n_total > 0 else 0.0
+            ratios[algo_label] = ratio
+
+            if n_valid == 0 or ratio < min_ratio:
+                floor_is_available = False
+
+        ratio_record[floor_pct] = ratios
+
+        if floor_is_available:
+            return floor_pct, ratio_record
+
+    return None, ratio_record
+
+
 def select_best_eval_file_combination(
     outputs_dir: Path,
     firm_power: float,
-    reliability_floor_pct: float = RELIABILITY_FLOOR_PCT,
-    fallback_floor_pct: float = RELIABILITY_FALLBACK_FLOOR_PCT,
+    floor_rules: List[Tuple[float, float]] | None = None,
 ) -> Dict[str, Path]:
     """
-    Select one evaluation CSV per algorithm with preference for high reliability.
+    Select one evaluation CSV per algorithm.
 
-    Selection rule:
-    1) first try to keep only candidates with reliability >= reliability_floor_pct
-       (default: 85%);
-    2) if at least one algorithm has no candidate above this preferred floor,
-       fall back to fallback_floor_pct (default: 80%);
-    3) among feasible cross-algorithm combinations, prefer:
-       - larger minimum reliability across algorithms;
-       - larger mean reliability across algorithms;
-       - smaller reliability variance;
-       - smaller reliability range;
-       - smaller sum of lambda values.
-
-    This avoids selecting a low-reliability combination merely because the four
-    algorithms have similar reliability values.
+    Candidate files are filtered with adaptive reliability coverage rules. The
+    selected combination prioritizes reliability target proximity,
+    cross-algorithm reliability consistency, and smaller lambda values.
     """
+    if floor_rules is None:
+        floor_rules = RELIABILITY_FLOOR_RULES
+
     raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
-    preferred_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
 
     for algo_label in ALGO_ORDER:
         algo_dir_name = ALGO_DIR_MAP[algo_label]
         eval_dir = outputs_dir / "evaluation" / algo_dir_name
-        raw_candidates = collect_eval_candidates(algo_label, eval_dir, firm_power=firm_power)
-        raw_candidate_map[algo_label] = raw_candidates
-        preferred_candidate_map[algo_label] = [
-            item for item in raw_candidates
-            if item[2] >= reliability_floor_pct
-        ]
-
-    use_preferred_floor = all(
-        len(preferred_candidate_map[algo_label]) > 0
-        for algo_label in ALGO_ORDER
-    )
-    active_floor = reliability_floor_pct if use_preferred_floor else fallback_floor_pct
-
-    if not use_preferred_floor:
-        print(
-            f"Warning: not every algorithm has a candidate with reliability >= "
-            f"{reliability_floor_pct:.2f}%. Falling back to >= {fallback_floor_pct:.2f}%."
+        raw_candidate_map[algo_label] = collect_eval_candidates(
+            algo_label,
+            eval_dir,
+            firm_power=firm_power,
         )
 
+    active_floor, ratio_record = choose_adaptive_reliability_floor(
+        raw_candidate_map,
+        floor_rules,
+    )
+
+    print("Adaptive reliability coverage:")
+    for floor_pct, ratios in ratio_record.items():
+        rule_ratio = dict(floor_rules).get(floor_pct, float("nan"))
+        print(f"  Floor >= {floor_pct:.2f}% | required candidate ratio = {rule_ratio * 100:.1f}%")
+        for algo_label in ALGO_ORDER:
+            print(f"    {algo_label}: {ratios[algo_label] * 100:.1f}%")
+
+    if active_floor is None:
+        print("Active reliability floor: none")
+    else:
+        print(f"Active reliability floor: {active_floor:.2f}%")
+
     candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
+
     for algo_label in ALGO_ORDER:
         raw_candidates = raw_candidate_map[algo_label]
-        valid_candidates = [
-            item for item in raw_candidates
-            if item[2] >= active_floor
-        ]
+
+        if active_floor is None:
+            valid_candidates = raw_candidates
+        else:
+            valid_candidates = [
+                item for item in raw_candidates
+                if item[2] >= active_floor
+            ]
 
         if not valid_candidates:
             best_candidate = max(raw_candidates, key=lambda item: item[2])
             raise ValueError(
-                f"No evaluation CSV for {algo_label} satisfies the active reliability floor "
-                f">= {active_floor:.2f}%. "
+                f"No valid evaluation CSV for {algo_label}. "
                 f"Best available file is {best_candidate[0].name} "
                 f"with reliability = {best_candidate[2]:.2f}%."
             )
@@ -224,6 +254,12 @@ def select_best_eval_file_combination(
     algo_labels = list(ALGO_ORDER)
     all_products = product(*(candidate_map[algo] for algo in algo_labels))
 
+    target_reliability = (
+        active_floor + TARGET_RELIABILITY_MARGIN_PCT
+        if active_floor is not None
+        else None
+    )
+
     feasible: List[Dict[str, object]] = []
 
     for combo in all_products:
@@ -231,8 +267,15 @@ def select_best_eval_file_combination(
         lambdas = np.array([item[1] for item in combo], dtype=float)
         selected = {algo_labels[i]: combo[i][0] for i in range(len(algo_labels))}
 
+        target_error = (
+            float(np.mean((reliabilities - target_reliability) ** 2))
+            if target_reliability is not None
+            else 0.0
+        )
+
         feasible.append(
             {
+                "target_error": target_error,
                 "min_reliability": float(np.min(reliabilities)),
                 "mean_reliability": float(np.mean(reliabilities)),
                 "variance": float(np.var(reliabilities)),
@@ -243,20 +286,26 @@ def select_best_eval_file_combination(
             }
         )
 
-    best = max(
+    if not feasible:
+        raise ValueError("No feasible cross-algorithm evaluation combination is available.")
+
+    best = min(
         feasible,
         key=lambda item: (
-            item["min_reliability"],       # maximize the worst algorithm's reliability
-            item["mean_reliability"],      # maximize average reliability
-            -item["variance"],             # minimize reliability variance
-            -item["range"],                # minimize reliability range
-            -item["lambda_sum"],           # minimize lambda sum
+            item["target_error"],
+            item["variance"],
+            item["range"],
+            -item["min_reliability"],
+            item["lambda_sum"],
         ),
     )
 
+    target_msg = "none" if target_reliability is None else f"{target_reliability:.2f}%"
     print(
         "Selection objective: "
-        f"active_floor = {active_floor:.2f}%, "
+        f"active_floor = {'none' if active_floor is None else f'{active_floor:.2f}%'}, "
+        f"target_reliability = {target_msg}, "
+        f"target_error = {best['target_error']:.4f}, "
         f"min_reliability = {best['min_reliability']:.2f}%, "
         f"mean_reliability = {best['mean_reliability']:.2f}%, "
         f"variance = {best['variance']:.4f}, "
@@ -914,7 +963,7 @@ def main() -> None:
     selected_files = select_best_eval_file_combination(
         outputs_dir=outputs_dir,
         firm_power=reservoir.firm_power,
-        reliability_floor_pct=RELIABILITY_FLOOR_PCT,
+        floor_rules=RELIABILITY_FLOOR_RULES,
     )
 
     frames: List[pd.DataFrame] = []
