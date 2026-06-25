@@ -1,0 +1,38 @@
+
+sdp:
+  n_inflow_classes: 20
+  threshold: 0.01
+
+iso_surf:
+  smoothing_factor: 1.0
+  spline_order: [3, 3]
+  grid_size: 25
+  max_factor: 10000
+  min_samples_spline: 20
+
+dqn:
+  agent:
+    learning_rate: 0.0008
+    reward_decay: 0.97
+    epsilon_start: 0.95
+    epsilon_end: 0.01
+    epsilon_decay: 0.990
+    replace_target_iter: 400
+    memory_size: 1000
+    batch_size: 128
+    firm_penalty_lambda: 20
+
+  network:
+    hidden_size: 768
+
+  train:
+    study_iteration: 10000
+    max_steps: 240
+    num_envs: 1
+
+  experiment:
+    seed_list: [1, 10, 42, 100]
+
+  display:
+    show_progress: true
+    progress_update_freq: 10

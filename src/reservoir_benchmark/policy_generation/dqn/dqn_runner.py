@@ -63,19 +63,20 @@ def run_training_sweep_lambdas():
     penalty_settings_path = data_dir / "penalty_settings.yaml"
     lam_list = load_penalty_candidates(penalty_settings_path, "dqn")
 
+    base_config = Config()
+
     for lam in lam_list:
         print("\n" + "=" * 80)
         print(f"[SWEEP] Start training with firm_penalty_lambda = {lam}")
         print("=" * 80)
+        for seed in base_config.get_seed_list():
+            run_training(firm_penalty_lambda=float(lam), seed=int(seed))
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        run_training(firm_penalty_lambda=float(lam))
 
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
-def run_training(firm_penalty_lambda: float) -> None:
+def run_training(firm_penalty_lambda: float, seed: int) -> None:
     """
     Train one DQN model for a single lambda value.
     """
@@ -93,7 +94,9 @@ def run_training(firm_penalty_lambda: float) -> None:
 
     # Build a fresh DQN configuration for the current training run and inject
     # the current firm-power penalty coefficient into the agent settings.
+
     config = Config()
+    config.set_seed(seed)
     config.agent_config["firm_penalty_lambda"] = float(firm_penalty_lambda)
 
     # Fix all random seeds before environment and network creation so that
@@ -107,7 +110,7 @@ def run_training(firm_penalty_lambda: float) -> None:
 
     model_output_dir = get_policy_generation_dir("dqn") / "policy"
     model_output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = model_output_dir / f"dqn_train_lambda_{lam_str}.pth"
+    model_path = model_output_dir / f"dqn_train_lambda_{lam_str}_seed_{seed}.pth"
 
     print(f"Model output path: {model_path}")
 

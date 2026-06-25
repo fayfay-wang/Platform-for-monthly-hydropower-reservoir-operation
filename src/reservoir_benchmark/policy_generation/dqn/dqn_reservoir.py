@@ -83,6 +83,7 @@ class ReservoirEnv(gym.Env):
         self.power_coefficient = float(self.basic_info.power_coefficient)
         self.firm_power = float(self.basic_info.firm_power)
         self.firm_penalty_lambda = float(self.basic_info.firm_penalty_lambda)
+        self.inflow_upper_bound = float(self.basic_info.inflow_upper_bound)
 
         # Unified time-step parameters
         self.delta_t_days = float(self.basic_info.delta_t_days)
@@ -100,13 +101,12 @@ class ReservoirEnv(gym.Env):
         # Observation space: [storage, inflow, month]
         self.observation_space = GBox(
             low=np.array([self.dead_storage, 0.0, 1.0], dtype=np.float32),
-            high=np.array([self.normal_storage, 5000.0, 12.0], dtype=np.float32),
+            high=np.array(
+                [self.normal_storage, self.inflow_upper_bound, 12.0],
+                dtype=np.float32,
+            ),
             dtype=np.float32,
         )
-
-        # Inflow data
-        self.train_data = self.basic_info.train_inflow
-        self.test_data = self.basic_info.test_inflow
 
         # Inflow data
         self.train_data = self.basic_info.train_inflow

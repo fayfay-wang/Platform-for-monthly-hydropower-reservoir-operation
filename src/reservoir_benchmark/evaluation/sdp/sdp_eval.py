@@ -147,40 +147,45 @@ class SDPReservoirSimulator:
 
         self.lookup_table = None
 
-        def simulate_operation(self, inflows: np.ndarray, initial_level: float | None = None):
+    def simulate_operation(
+        self,
+        inflows: np.ndarray,
+        initial_level: float | None = None,
+    ):
         """
         Simulate one year of reservoir operation using the SDP decision table.
         The initial level should be passed from the previous year's ending level
         during multi-year evaluation.
         """
+
         current_level = self.initial_level if initial_level is None else float(initial_level)
-    
+
         monthly_levels = [current_level]
         monthly_energy = []
         monthly_power = []
         monthly_spill = []
         monthly_turbine_discharge = []
         monthly_total_discharge = []
-    
+
         for month in range(12):
             inflow = float(inflows[month])
             target_level = self.lookup_table.find_decision_level(
                 month + 1, current_level, inflow
             )
-    
+
             current_storage = self.reservoir_model.calculate_storage(current_level)
             target_storage = self.reservoir_model.calculate_storage(target_level)
-    
+
             total_discharge = (
-                (current_storage - target_storage) * 1e9
-                / (self.delta_t_days * 24.0 * 60.0 * 60.0)
-                + inflow
+                    (current_storage - target_storage) * 1e9
+                    / (self.delta_t_days * 24.0 * 60.0 * 60.0)
+                    + inflow
             )
-    
+
             if total_discharge < 0:
                 adjusted_target_storage = (
-                    current_storage
-                    + inflow * self.delta_t_days * 24.0 * 60.0 * 60.0 / 1e9
+                        current_storage
+                        + inflow * self.delta_t_days * 24.0 * 60.0 * 60.0 / 1e9
                 )
                 target_level = self.reservoir_model.calculate_level(adjusted_target_storage)
                 turbine_discharge = 0.0
@@ -190,53 +195,53 @@ class SDPReservoirSimulator:
             else:
                 turbine_discharge = total_discharge
                 spill_discharge = 0.0
-    
+
                 power_kw = self.reservoir_model.calculate_power(
                     turbine_discharge,
                     total_discharge,
                     current_level,
                     target_level,
                 )
-    
+
                 if power_kw > self.max_power:
                     average_upstream_level = (target_level + current_level) / 2.0
                     tailwater = self.reservoir_model.calculate_tailwater(total_discharge)
                     average_head = max(average_upstream_level - tailwater, 0.01)
-    
+
                     turbine_discharge = self.max_power / (
-                        self.power_coefficient * average_head
+                            self.power_coefficient * average_head
                     )
                     spill_discharge = max(total_discharge - turbine_discharge, 0.0)
-    
+
                     power_kw = self.reservoir_model.calculate_power(
                         turbine_discharge,
                         total_discharge,
                         current_level,
                         target_level,
                     )
-    
+
                 if turbine_discharge > self.max_turbine_discharge:
                     turbine_discharge = self.max_turbine_discharge
                     spill_discharge = max(total_discharge - turbine_discharge, 0.0)
-    
+
                     power_kw = self.reservoir_model.calculate_power(
                         turbine_discharge,
                         total_discharge,
                         current_level,
                         target_level,
                     )
-    
+
             energy_gwh = power_kw * self.delta_t_days * 24.0 / 1e6
-    
+
             monthly_power.append(power_kw)
             monthly_energy.append(energy_gwh)
             monthly_turbine_discharge.append(turbine_discharge)
             monthly_spill.append(spill_discharge)
             monthly_total_discharge.append(total_discharge)
-    
+
             monthly_levels.append(target_level)
             current_level = target_level
-    
+
         return (
             monthly_levels,
             monthly_energy,
@@ -306,7 +311,7 @@ class SDPReservoirSimulator:
         )
 
         print("\nStarting evaluation simulation...\n")
-        all_monthly_levels = []
+        all_monthly_levels = [self.initial_level]
         all_monthly_energy = []
         all_monthly_power = []
         all_monthly_spill = []
@@ -349,7 +354,7 @@ class SDPReservoirSimulator:
                 f"annual spilled water: {year_spill:.2f} m³/s"
             )
 
-        print("\nGenerating diagnostic figures...")
+        print("\nGenerating evaluation CSV...")
 
         inflow_flat = inflows.reshape(-1)
         n = years * 12
@@ -357,7 +362,7 @@ class SDPReservoirSimulator:
         sdp_results = pd.DataFrame(
             {
                 "Month": range(1, n + 1),
-                "Water_Level_m": all_monthly_levels[1 : n + 1],
+                "Water_Level_m": all_monthly_levels[1: n + 1],
                 "Power_kW": all_monthly_power,
                 "Electricity_GWh": all_monthly_energy,
                 "Total_Discharge_m3s": all_monthly_total_discharge,

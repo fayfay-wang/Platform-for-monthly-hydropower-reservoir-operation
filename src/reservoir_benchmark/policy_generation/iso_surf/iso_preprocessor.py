@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from reservoir_benchmark.policy_generation.dp.dp_solver import ReservoirOperation as DPSolver
+from reservoir_benchmark.policy_generation.ddp.ddp_solver import ReservoirOperation as DPSolver
 from reservoir_benchmark.shared.io_utils import (
     load_monthly_inflows_from_excel,
     load_penalty_candidates,

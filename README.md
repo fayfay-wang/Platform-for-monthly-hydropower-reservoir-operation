@@ -12,7 +12,7 @@ The project is intended for reproducible comparison of reservoir operation polic
 ## Features
 
 - Shared reservoir model for all algorithms, including level-storage conversion, tailwater estimation, and hydropower calculation.
-- Standardized input layout for training inflows, evaluation inflows, reservoir settings, level-storage curves, tailwater curves, and penalty coefficients.
+- Standardized input layout for training inflows, evaluation inflows, reservoir settings, level-storage curves, tailwater curves, penalty coefficients, and algorithm experiment settings.
 - Policy generation workflows for SDP, ISO-SURF, and DQN.
 - Direct deterministic evaluation with DDP.
 - Standardized evaluation outputs for cross-method comparison.
@@ -29,6 +29,7 @@ data/
   level_storage_curve.csv
   tailwater_discharge_curve.csv
   penalty_settings.yaml
+  experiment_settings.yaml
 scripts/
   run_policy_generation.py
   run_evaluation.py
@@ -112,6 +113,9 @@ Required fields include:
 - `firm_power`
 - `power_coefficient`
 - `delta_t_days`
+- `inflow_upper_bound`
+
+`inflow_upper_bound` is the single source of truth for the DQN inflow upper bound. It is read by the DQN environment and agent for the inflow component of the observation space and state normalization. Update this value when adapting the benchmark to a reservoir whose inflow range exceeds the configured bound.
 
 ### Curves
 
@@ -141,6 +145,14 @@ iso_surf:
 dqn:
   candidates: [0, 5, 10]
 ```
+
+### Experiment Settings
+
+Algorithm-specific experiment parameters are defined in `data/experiment_settings.yaml`. This file keeps reusable engineering settings out of the runners and separates algorithm hyperparameters from reservoir physical parameters. It includes:
+
+- SDP inflow discretization settings such as `sdp.n_inflow_classes` and `sdp.threshold`.
+- ISO-SURF fitting settings such as `iso_surf.smoothing_factor`, `iso_surf.spline_order`, `iso_surf.grid_size`, `iso_surf.max_factor`, and `iso_surf.min_samples_spline`.
+- DQN agent, network, training, seed, and progress-display settings under `dqn.agent`, `dqn.network`, `dqn.train`, `dqn.experiment`, and `dqn.display`.
 
 ## Quick Start
 
@@ -174,6 +186,7 @@ Figures and summary files are written to `outputs/visualization/`.
 Input data
    |
    +-- Training inflow + reservoir parameters
+   |      + experiment settings
    |      -> SDP / ISO-SURF / DQN policy generation
    |
    +-- Evaluation inflow + reservoir parameters + generated policies
@@ -225,6 +238,7 @@ To apply the repository to a new reservoir, update at least:
 - `data/SynMonthlyInflow_train.xlsx`
 - `data/SynMonthlyInflow_evaluation.xlsx`
 - `data/penalty_settings.yaml`
+- `data/experiment_settings.yaml`
 
 Before rerunning the benchmark, check that:
 
@@ -233,6 +247,7 @@ Before rerunning the benchmark, check that:
 - Storage generally increases monotonically with water level.
 - The tailwater curve covers the normal total-discharge range.
 - Inflow units are `m3/s`.
+- `inflow_upper_bound` in `data/reservoir_settings.txt` covers the expected inflow range used by the DQN observation space and normalization.
 - `max_power` and `firm_power` are expressed in kW.
 
 After changing the training inflow or reservoir physical parameters, regenerate SDP, ISO-SURF, and DQN policy artifacts. DDP does not require a pre-trained policy, but evaluation must be rerun.
@@ -262,8 +277,8 @@ docs_build/html/index.html
 
 - Input paths currently point to the repository-level `data/` directory.
 - DDP, SDP, and ISO-SURF use 1 m water-level discretization by default.
-- SDP inflow discretization is fixed at 20 classes in the current runner.
-- The DQN observation space currently uses an inflow upper bound of `5000.0 m3/s`; update the DQN environment if a new reservoir has larger inflows.
+- SDP inflow discretization is configured by `sdp.n_inflow_classes` in `data/experiment_settings.yaml`.
+- The DQN observation space and normalization use `inflow_upper_bound` from `data/reservoir_settings.txt`; this replaces the former hard-coded `5000.0 m3/s` inflow upper-bound assumption.
 - Trained DQN models can be large and are ignored by default through `*.pth` and `*.pt` patterns.
 
 ## License

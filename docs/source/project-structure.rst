@@ -25,7 +25,7 @@ Shared Layer
 
 ``shared/reservoir_model.py`` reads reservoir parameters, the level-storage curve, and the tailwater curve. It also provides level-storage conversion, tailwater calculation, and hydropower output calculation.
 
-``shared/io_utils.py`` reads inflow Excel files, lambda candidate settings, and SDP inflow discretization files.
+``shared/io_utils.py`` reads inflow Excel files, penalty lambda candidates, and algorithm experiment settings.
 
 ``shared/project_paths.py`` centralizes paths for ``data`` and ``outputs``.
 

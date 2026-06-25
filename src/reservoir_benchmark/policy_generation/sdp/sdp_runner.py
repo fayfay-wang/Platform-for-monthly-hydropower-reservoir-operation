@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """
 SDP execution and rule-export module for the unified reservoir operation
@@ -16,6 +15,7 @@ The purpose of this module is to separate experiment orchestration from the SDP
 solver itself, thereby keeping the optimization logic independent from path
 management, shared input loading, parameter looping, and result export.
 """
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -24,8 +24,10 @@ import pandas as pd
 from reservoir_benchmark.policy_generation.sdp.sdp_preprocessor import SDPInflowDiscretizer
 from reservoir_benchmark.policy_generation.sdp.sdp_solver import ReservoirOperation
 from reservoir_benchmark.shared.io_utils import (
+    load_algorithm_settings,
     load_penalty_candidates,
     load_sdp_inflow_intervals,
+    require_keys,
 )
 from reservoir_benchmark.shared.project_paths import (
     format_lambda_for_filename,
@@ -99,7 +101,17 @@ def main_sdp() -> None:
 
     train_inflow_file = data_dir / "SynMonthlyInflow_train.xlsx"
     penalty_settings_file = data_dir / "penalty_settings.yaml"
-    n_inflow_discrete = 20
+    experiment_settings_file = data_dir / "experiment_settings.yaml"
+
+    sdp_settings = load_algorithm_settings(experiment_settings_file, "sdp")
+    require_keys(
+        sdp_settings,
+        ["n_inflow_classes", "threshold"],
+        "sdp",
+    )
+
+    n_inflow_discrete = int(sdp_settings["n_inflow_classes"])
+    threshold = float(sdp_settings["threshold"])
 
     # Step 1: generate SDP inflow discretization file automatically
     discretizer = SDPInflowDiscretizer(
@@ -136,7 +148,8 @@ def main_sdp() -> None:
             flow_probs=flow_probs,
             flow_intervals=flow_intervals,
         )
-        solver.config["firm_power_penalty_lambda"] = lam
+        solver.config["threshold"] = threshold
+        solver.config["firm_power_penalty_lambda"] = float(lam)
 
         expected_total_energy, optimal_decisions, annual_energy, history = solver.optimize()
 

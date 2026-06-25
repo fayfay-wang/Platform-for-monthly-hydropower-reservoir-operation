@@ -46,6 +46,9 @@ Reservoir Parameters
    "firm_power": 1854000
    "power_coefficient": 8.5
    "delta_t_days": 30.4
+   "inflow_upper_bound": 5000.0
+
+``inflow_upper_bound`` is the configured DQN inflow upper bound. It is read from this file by the DQN environment and agent, so the observation-space bound and inflow normalization stay consistent with the reservoir data instead of being maintained as code constants.
 
 Field descriptions:
 
@@ -79,6 +82,9 @@ Field descriptions:
    * - ``delta_t_days``
      - Time-step length expressed as days per month
      - day
+   * - ``inflow_upper_bound``
+     - Upper bound used by the DQN observation space and inflow normalization
+     - ``m3/s``
 
 Level-Storage Curve
 -------------------
@@ -119,3 +125,46 @@ Penalty Coefficients
      candidates: [0, 5, 10]
 
 The lambda value is embedded in output file names, for example ``sdp_train_lambda_1.xlsx``.
+
+Experiment Settings
+-------------------
+
+``data/experiment_settings.yaml`` stores algorithm-specific experiment parameters that are shared by the runners. Use this file for reusable algorithm behavior and hyperparameters; keep reservoir physical parameters, including ``inflow_upper_bound``, in ``data/reservoir_settings.txt``.
+
+.. code-block:: yaml
+
+   sdp:
+     n_inflow_classes: 20
+     threshold: 0.01
+
+   iso_surf:
+     smoothing_factor: 1.0
+     spline_order: [3, 3]
+     grid_size: 25
+     max_factor: 10000
+     min_samples_spline: 20
+
+   dqn:
+     agent:
+       learning_rate: 0.0008
+       reward_decay: 0.97
+       epsilon_start: 0.95
+       epsilon_end: 0.01
+       epsilon_decay: 0.990
+       replace_target_iter: 400
+       memory_size: 1000
+       batch_size: 128
+       firm_penalty_lambda: 20
+     network:
+       hidden_size: 768
+     train:
+       study_iteration: 10000
+       max_steps: 240
+       num_envs: 1
+     experiment:
+       seed_list: [1, 10, 42, 100]
+     display:
+       show_progress: true
+       progress_update_freq: 10
+
+The penalty sweep values still belong in ``data/penalty_settings.yaml``. The experiment settings file controls reusable algorithm behavior such as SDP inflow discretization, ISO-SURF fitting, and DQN training hyperparameters.

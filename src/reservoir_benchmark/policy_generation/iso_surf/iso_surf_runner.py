@@ -26,7 +26,11 @@ import pandas as pd
 from scipy.interpolate import SmoothBivariateSpline
 
 from reservoir_benchmark.policy_generation.iso_surf.iso_preprocessor import ISOPreprocessor
-from reservoir_benchmark.shared.io_utils import load_penalty_candidates
+from reservoir_benchmark.shared.io_utils import (
+    load_algorithm_settings,
+    load_penalty_candidates,
+    require_keys,
+)
 from reservoir_benchmark.shared.project_paths import (
     format_lambda_for_filename,
     get_data_dir,
@@ -39,8 +43,23 @@ class ISOSurfPolicyFitter:
     Fit and persist monthly ISO-SURF policy surfaces.
     """
 
-    def __init__(self, smoothing_factor: float = 1.0):
-        self.smoothing_factor = smoothing_factor
+    def __init__(
+        self,
+        smoothing_factor: float = 1.0,
+        spline_order: tuple[int, int] = (3, 3),
+        grid_size: int = 25,
+        max_factor: float = 10000.0,
+        min_samples_spline: int = 20,
+    ):
+        self.smoothing_factor = float(smoothing_factor)
+        self.spline_order = tuple(int(x) for x in spline_order)
+        self.grid_size = int(grid_size)
+        self.max_factor = float(max_factor)
+        self.min_samples_spline = int(min_samples_spline)
+
+        if len(self.spline_order) != 2:
+            raise ValueError("iso_surf.spline_order must contain exactly two integers.")
+
         self.month_models: dict[int, dict] = {}
         self.output_dir = get_policy_generation_dir("iso_surf") / "policy"
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +150,7 @@ class ISOSurfPolicyFitter:
 
             # If the available monthly samples are too few, skip spline fitting
             # and directly use the linear fallback model.
-            if n_m < 20:
+            if n_m < self.min_samples_spline:
                 self._fit_linear_only(month, df_m)
                 continue
 
@@ -152,7 +171,7 @@ class ISOSurfPolicyFitter:
             # Start from the base smoothing level and gradually increase it if
             # the spline is unstable or Fitpack reports warnings.
             factor = base_sf
-            max_factor = base_sf * 1e4
+            max_factor = base_sf * self.max_factor
             best_spline = None
 
             while factor <= max_factor:
@@ -165,8 +184,12 @@ class ISOSurfPolicyFitter:
                     warnings.simplefilter("always")
                     try:
                         spline = SmoothBivariateSpline(
-                            S_norm, I_norm, Z,
-                            kx=3, ky=3, s=s_val
+                            S_norm,
+                            I_norm,
+                            Z,
+                            kx=self.spline_order[0],
+                            ky=self.spline_order[1],
+                            s=s_val,
                         )
                     except Exception:
                         # If the fit fails completely, increase smoothing and retry.
@@ -191,7 +214,13 @@ class ISOSurfPolicyFitter:
 
                 # Even if fitting formally succeeds, reject the spline if it is
                 # numerically unhealthy on a regular evaluation grid.
-                ok, _, _, _, _ = _check_spline_health(S_norm, I_norm, Z, spline, grid_size=25)
+                ok, _, _, _, _ = _check_spline_health(
+                    S_norm,
+                    I_norm,
+                    Z,
+                    spline,
+                    grid_size=self.grid_size,
+                )
                 if not ok:
                     factor *= 5.0
                     continue
@@ -226,6 +255,13 @@ class ISOSurfPolicyFitter:
         Fit a linear fallback plane:
             S_{t+1} = a + b S_t + c I_t
         """
+        if df_m.empty:
+            self.month_models[month] = {
+                "mode": "identity",
+                "n_samples": 0,
+            }
+            return
+
         S_t = df_m["Water_Level_m"].values
         I_t = df_m["Inflow_m3s"].values
         Z = df_m["Next_Level_m"].values
@@ -255,6 +291,9 @@ class ISOSurfPolicyFitter:
             return float(S_t)
 
         mode = info.get("mode", "spline")
+
+        if mode == "identity":
+            return float(S_t)
 
         if mode == "spline":
             spline = info["spline"]
@@ -287,6 +326,10 @@ class ISOSurfPolicyFitter:
         # Save only the information needed later for evaluation and prediction.
         payload = {
             "smoothing_factor": self.smoothing_factor,
+            "spline_order": self.spline_order,
+            "grid_size": self.grid_size,
+            "max_factor": self.max_factor,
+            "min_samples_spline": self.min_samples_spline,
             "month_models": self.month_models,
         }
 
@@ -305,7 +348,13 @@ class ISOSurfPolicyFitter:
         with policy_path.open("rb") as f:
             payload = pickle.load(f)
 
-        obj = cls(smoothing_factor=payload.get("smoothing_factor", 1.0))
+        obj = cls(
+            smoothing_factor=payload.get("smoothing_factor", 1.0),
+            spline_order=tuple(payload.get("spline_order", (3, 3))),
+            grid_size=payload.get("grid_size", 25),
+            max_factor=payload.get("max_factor", 10000.0),
+            min_samples_spline=payload.get("min_samples_spline", 20),
+        )
         obj.month_models = payload["month_models"]
         return obj
 
@@ -314,7 +363,26 @@ def main_iso_surf() -> None:
     """
     Generate upstream DP training data first, then fit and save ISO-SURF policies.
     """
+
     data_dir = get_data_dir()
+    experiment_settings_file = data_dir / "experiment_settings.yaml"
+    iso_settings = load_algorithm_settings(experiment_settings_file, "iso_surf")
+    require_keys(
+        iso_settings,
+        [
+            "smoothing_factor",
+            "spline_order",
+            "grid_size",
+            "max_factor",
+            "min_samples_spline",
+        ],
+        "iso_surf",
+    )
+
+    spline_order = tuple(int(x) for x in iso_settings["spline_order"])
+    if len(spline_order) != 2:
+        raise ValueError("iso_surf.spline_order must contain exactly two integers.")
+
     iso_root_dir = get_policy_generation_dir("iso_surf")
     preprocessed_dir = iso_root_dir / "preprocessed"
     policy_dir = iso_root_dir / "policy"
@@ -352,7 +420,13 @@ def main_iso_surf() -> None:
         # is loaded and used to fit a separate ISO-SURF monthly rule set.
         dp_df = pd.read_csv(dp_csv_path)
 
-        fitter = ISOSurfPolicyFitter()
+        fitter = ISOSurfPolicyFitter(
+            smoothing_factor=float(iso_settings["smoothing_factor"]),
+            spline_order=spline_order,
+            grid_size=int(iso_settings["grid_size"]),
+            max_factor=float(iso_settings["max_factor"]),
+            min_samples_spline=int(iso_settings["min_samples_spline"]),
+        )
         fitter.fit_from_dp_dataframe(dp_df)
         fitter.save_policy(float(lam))
 

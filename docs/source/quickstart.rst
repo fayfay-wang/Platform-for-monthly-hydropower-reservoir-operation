@@ -15,6 +15,7 @@ Make sure the ``data`` directory contains at least the following files:
      level_storage_curve.csv
      tailwater_discharge_curve.csv
      penalty_settings.yaml
+     experiment_settings.yaml
 
 Generate Policies
 -----------------

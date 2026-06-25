@@ -12,7 +12,7 @@ To use this repository for a new reservoir, update or replace at least the follo
    * - File
      - What to update
    * - ``data/reservoir_settings.txt``
-     - Dead water level, normal pool level, initial level, turbine capacity, firm power, power coefficient, and time-step length
+     - Dead water level, normal pool level, initial level, turbine capacity, firm power, power coefficient, time-step length, and DQN inflow upper bound
    * - ``data/level_storage_curve.csv``
      - The new reservoir's level-storage curve. Column names must stay unchanged.
    * - ``data/tailwater_discharge_curve.csv``
@@ -23,6 +23,8 @@ To use this repository for a new reservoir, update or replace at least the follo
      - Evaluation inflow used by the unified benchmark
    * - ``data/penalty_settings.yaml``
      - Lambda candidates scanned by each algorithm
+   * - ``data/experiment_settings.yaml``
+     - SDP inflow discretization, ISO-SURF fitting settings, and DQN training hyperparameters
 
 Pre-Run Checks
 --------------
@@ -34,8 +36,9 @@ Before running a new-reservoir case, check that:
 3. Storage generally increases monotonically with water level.
 4. The tailwater curve covers the normal total-discharge range.
 5. The inflow files contain exactly 12 monthly columns after the first column is skipped, with units in ``m3/s``.
-6. ``max_power`` and ``firm_power`` are both expressed in kW.
-7. Old policy files have either been cleared or are expected to be overwritten.
+6. ``inflow_upper_bound`` in ``data/reservoir_settings.txt`` covers the expected inflow range used by DQN.
+7. ``max_power`` and ``firm_power`` are both expressed in kW.
+8. Old policy files have either been cleared or are expected to be overwritten.
 
 Artifacts That Must Be Regenerated
 ----------------------------------
@@ -62,7 +65,7 @@ Hard-Coded Assumptions to Check
 Several default settings are sensitive to the new reservoir:
 
 * DDP, SDP, and ISO-SURF use 1 m water-level discretization. A large operating range increases computational cost; a finer operating policy requires changing the discretization step in the algorithms.
-* The SDP inflow discretization is fixed at 20 classes in ``sdp_runner.py``.
-* The DQN observation space currently uses an inflow upper bound of ``5000.0 m3/s``. If the new reservoir has higher inflows, update ``dqn_reservoir.py``.
+* The SDP inflow discretization is configured by ``sdp.n_inflow_classes`` in ``data/experiment_settings.yaml``.
+* The DQN observation space and inflow normalization use ``inflow_upper_bound`` from ``data/reservoir_settings.txt``. If the new reservoir has higher inflows, update that setting instead of editing DQN source code.
 * The policy-generation entry point currently runs SDP by default. Enable the ISO-SURF and DQN calls if a full retraining run is required.
 * Input paths currently point to the repository-level ``data`` directory and are not command-line parameters.

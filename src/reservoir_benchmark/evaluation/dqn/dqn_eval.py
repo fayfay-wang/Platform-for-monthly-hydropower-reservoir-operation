@@ -68,11 +68,10 @@ class ReservoirEvaluator:
 
         print("\nStarting evaluation...")
 
-        data = self.env.train_data if self.env.is_training else self.env.test_data
-        max_years = len(data)
-        end_year = end_year if end_year is not None else max_years - 1
-        start_year = max(0, min(start_year, max_years - 1))
-        end_year = max(start_year, min(end_year, max_years - 1))
+        if start_year < 0 or end_year < 0:
+            raise ValueError("start_year and end_year must be non-negative")
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
         num_years = end_year - start_year + 1
 
         print(
@@ -227,6 +226,48 @@ class ReservoirEvaluator:
         print(f"Aligned CSV exported to: {out_path}")
 
 
+def aggregate_seed_results(input_files, output_file):
+    """
+    Average DQN evaluation results across seeds.
+    """
+
+    if not input_files:
+        raise ValueError("No seed evaluation files provided.")
+
+    dfs = [pd.read_csv(f) for f in input_files]
+
+    reference_month = dfs[0]["Month"].reset_index(drop=True)
+
+    for file, df in zip(input_files[1:], dfs[1:]):
+        if not reference_month.equals(df["Month"].reset_index(drop=True)):
+            raise ValueError(f"Month mismatch in seed result file: {file}")
+
+    mean_columns = [
+        "Water_Level_m",
+        "Power_kW",
+        "Electricity_GWh",
+        "Total_Discharge_m3s",
+        "Turbine_Discharge_m3s",
+        "Spill_Discharge_m3s",
+    ]
+
+    reference = dfs[0].copy()
+
+    for col in mean_columns:
+        reference[col] = pd.concat(
+            [pd.to_numeric(df[col], errors="coerce") for df in dfs],
+            axis=1,
+        ).mean(axis=1)
+
+    reference.to_csv(
+        output_file,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(f"Multi-seed mean result saved to:\n{output_file}")
+
+
 def run_evaluation():
     """
     Evaluate all trained DQN models defined by dqn.candidates.
@@ -237,45 +278,76 @@ def run_evaluation():
 
     model_dir = get_policy_generation_dir("dqn") / "policy"
     eval_output_dir = get_outputs_dir() / "evaluation" / "dqn"
+    by_seed_dir = eval_output_dir / "by_seed"
     eval_output_dir.mkdir(parents=True, exist_ok=True)
+    by_seed_dir.mkdir(parents=True, exist_ok=True)
+
+    base_config = Config()
+
+    seed_list = base_config.get_seed_list()
 
     for lam in lam_list:
         lam_str = format_lambda_for_filename(float(lam))
-        model_path = model_dir / f"dqn_train_lambda_{lam_str}.pth"
+        seed_result_files = []
+        for seed in seed_list:
+            model_path = model_dir / f"dqn_train_lambda_{lam_str}_seed_{seed}.pth"
 
-        if not model_path.exists():
-            print(f"Skip lambda={lam}: model file not found -> {model_path}")
+            if not model_path.exists():
+                print(f"Model not found: {model_path}, skipping seed {seed}")
+                continue
+
+            print("\n" + "=" * 80)
+            print(f"Start evaluating lambda={lam}, seed={seed}")
+            print("=" * 80)
+
+            config = Config()
+            config.agent_config["firm_penalty_lambda"] = float(lam)
+
+            config.set_seed(seed)
+
+            set_global_seed(seed)
+
+            basic_info = BasicInfo(config)
+            env = ReservoirEnv(basic_info)
+            env.is_training = False
+
+            agent = DQNAgent(
+                n_actions=env.action_space.n,
+                n_features=env.observation_space.shape[0],
+                config=config,
+                basic_info=basic_info,
+            )
+
+            evaluator = ReservoirEvaluator(env, agent, by_seed_dir)
+
+            seed_output_name = f"dqn_eval_lambda_{lam_str}_seed_{seed}.csv"
+
+            seed_output_path = by_seed_dir / seed_output_name
+
+            success = evaluator.run_evaluation(
+                model_path=model_path,
+                num_episodes=1,
+                start_year=0,
+                end_year=len(basic_info.test_inflow) - 1,
+                output_csv_name=seed_output_name,
+            )
+
+            if success and seed_output_path.exists():
+                seed_result_files.append(seed_output_path)
+            else:
+                print(f"Skip seed={seed}: evaluation failed or output file missing")
+
+        if not seed_result_files:
+            print(f"Skip lambda={lam}: no valid seed results")
             continue
 
-        print("\n" + "=" * 80)
-        print(f"Start evaluating lambda = {lam}")
-        print("=" * 80)
-
-        config = Config()
-        config.agent_config["firm_penalty_lambda"] = float(lam)
-
-        set_global_seed(config.get_seed())
-
-        basic_info = BasicInfo(config)
-        env = ReservoirEnv(basic_info)
-        env.is_training = False
-
-        agent = DQNAgent(
-            n_actions=env.action_space.n,
-            n_features=env.observation_space.shape[0],
-            config=config,
-            basic_info=basic_info,
+        aggregate_seed_results(
+            input_files=seed_result_files,
+            output_file=(
+                    eval_output_dir / f"dqn_eval_lambda_{lam_str}.csv"
+            ),
         )
 
-        evaluator = ReservoirEvaluator(env, agent, eval_output_dir)
-
-        evaluator.run_evaluation(
-            model_path=model_path,
-            num_episodes=1,
-            start_year=0,
-            end_year=len(basic_info.test_inflow) - 1,
-            output_csv_name=f"dqn_eval_lambda_{lam_str}.csv",
-        )
 
 
 def main_dqn_eval() -> None:

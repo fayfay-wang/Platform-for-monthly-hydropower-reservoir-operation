@@ -27,7 +27,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch import amp
 
-from reservoir_benchmark.shared.io_utils import load_monthly_inflows_from_excel
+from reservoir_benchmark.shared.io_utils import (
+    load_algorithm_settings,
+    load_monthly_inflows_from_excel,
+    require_keys,
+)
 from reservoir_benchmark.shared.project_paths import get_data_dir
 from reservoir_benchmark.shared.reservoir_model import SharedReservoirModel
 
@@ -50,39 +54,63 @@ class Config:
     """
 
     def __init__(self):
-        self.agent_config = {
-            "learning_rate": 0.0008,
-            "reward_decay": 0.97,
-            "epsilon_start": 0.95,
-            "epsilon_end": 0.01,
-            "epsilon_decay": 0.990,
-            "replace_target_iter": 400,
-            "memory_size": 2000,
-            "batch_size": 128,
-            "firm_power": 1_854_000,
-            "firm_penalty_lambda": 20.0,
-            "power_coefficient": 9.81,
-        }
+        settings_path = get_data_dir() / "experiment_settings.yaml"
+        settings = load_algorithm_settings(settings_path, "dqn")
 
-        self.network_config = {
-            "hidden_size": 768,
-        }
+        require_keys(
+            settings,
+            ["agent", "network", "train", "experiment", "display"],
+            "dqn",
+        )
 
-        self.train_config = {
-            "study_iteration": 10000,
-            "max_steps": 240,
-            "num_envs": 1,
-        }
+        self.agent_config = settings["agent"]
+        self.network_config = settings["network"]
+        self.train_config = settings["train"]
+        self.experiment_config = settings["experiment"]
+        self.display_config = settings["display"]
 
-        self.display_config = {
-            "show_progress": True,
-            "progress_update_freq": 10,
-        }
+        require_keys(
+            self.agent_config,
+            [
+                "learning_rate",
+                "reward_decay",
+                "epsilon_start",
+                "epsilon_end",
+                "epsilon_decay",
+                "replace_target_iter",
+                "memory_size",
+                "batch_size",
+                "firm_penalty_lambda",
+            ],
+            "dqn.agent",
+        )
+        require_keys(self.network_config, ["hidden_size"], "dqn.network")
+        require_keys(
+            self.train_config,
+            ["study_iteration", "max_steps", "num_envs"],
+            "dqn.train",
+        )
+        require_keys(self.experiment_config, ["seed_list"], "dqn.experiment")
+        require_keys(
+            self.display_config,
+            ["show_progress", "progress_update_freq"],
+            "dqn.display",
+        )
 
-        self.seed = 42
+        self.seed_list = [int(seed) for seed in self.experiment_config["seed_list"]]
+        if not self.seed_list:
+            raise ValueError("dqn.experiment.seed_list must not be empty.")
+
+        self.seed = self.seed_list[0]
 
     def get_seed(self):
-        return getattr(self, "seed", 42)
+        return self.seed
+
+    def get_seed_list(self):
+        return self.seed_list
+
+    def set_seed(self, seed: int):
+        self.seed = int(seed)
 
     def get_agent_params(self):
         return self.agent_config
@@ -104,29 +132,23 @@ class BasicInfo:
         self.data_dir = get_data_dir()
         self.reservoir_model = SharedReservoirModel(data_dir=self.data_dir)
 
-        # Shared reservoir parameters (new unified names only)
+        # Shared reservoir parameters
         self.normal_level = self.reservoir_model.normal_level
         self.dead_level = self.reservoir_model.dead_level
         self.initial_level = self.reservoir_model.initial_level
         self.max_turbine_discharge = self.reservoir_model.max_turbine_discharge
         self.max_power = self.reservoir_model.max_power
-        self.power_coefficient = float(
-            self.config.agent_config.get(
-                "power_coefficient",
-                self.reservoir_model.power_coefficient,
-            )
-        )
+        self.power_coefficient = self.reservoir_model.power_coefficient
+        self.firm_power = self.reservoir_model.firm_power
+        self.inflow_upper_bound = self.reservoir_model.inflow_upper_bound
 
+        # Shared time-step parameters
         self.delta_t_days = self.reservoir_model.delta_t_days
         self.delta_t_hours = self.reservoir_model.delta_t_hours
         self.delta_t_seconds = self.reservoir_model.delta_t_seconds
 
-        self.firm_power = float(
-            self.config.agent_config.get("firm_power", self.reservoir_model.firm_power)
-        )
-        self.firm_penalty_lambda = float(
-            self.config.agent_config.get("firm_penalty_lambda", 0.0)
-        )
+        # Experiment-controlled penalty parameter
+        self.firm_penalty_lambda = float(self.config.agent_config["firm_penalty_lambda"])
 
         self.months = list(range(1, 13))
 
@@ -279,7 +301,7 @@ class DQNAgent:
         self.epsilon_decay = agent_cfg["epsilon_decay"]
         self.epsilon = self.epsilon_start
 
-        self.memory = ReplayBuffer(min(self.memory_size, 10000), n_features)
+        self.memory = ReplayBuffer(self.memory_size, n_features)
 
         self.eval_net = DQN(n_features, n_actions, config).to(self.device)
         self.target_net = DQN(n_features, n_actions, config).to(self.device)
@@ -297,7 +319,7 @@ class DQNAgent:
             dtype=np.float32,
         )
         self.state_high = np.array(
-            [basic_info.normal_storage, 5000.0, 12.0],
+            [basic_info.normal_storage, basic_info.inflow_upper_bound, 12.0],
             dtype=np.float32,
         )
         self._norm_scale = 1.0 / (self.state_high - self.state_low + 1e-8)

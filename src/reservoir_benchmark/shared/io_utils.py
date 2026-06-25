@@ -131,3 +131,47 @@ def load_sdp_inflow_intervals(file_path: Path, n_inflow_discrete: int):
 
     inflows = inflows.astype(float)
     return inflows, flow_probs, flow_intervals
+
+def load_experiment_settings(file_path: Path) -> dict:
+    """
+    Load experiment_settings.yaml.
+
+    Returns:
+        Entire yaml dictionary.
+    """
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Experiment settings file not found: {file_path}"
+        )
+
+    with file_path.open("r", encoding="utf-8") as f:
+        settings = yaml.safe_load(f)
+
+    if settings is None:
+        raise ValueError(
+            "experiment_settings.yaml is empty."
+        )
+
+    return settings
+
+def load_algorithm_settings(
+    file_path: Path,
+    algorithm: str,
+) -> dict:
+    """
+    Load configuration section for one algorithm.
+    """
+    settings = load_experiment_settings(file_path)
+
+    if algorithm not in settings:
+        raise KeyError(
+            f"Missing '{algorithm}' section "
+            f"in experiment_settings.yaml."
+        )
+
+    return settings[algorithm]
+
+def require_keys(settings: dict, keys: list[str], prefix: str) -> None:
+    missing = [key for key in keys if key not in settings]
+    if missing:
+        raise KeyError(f"Missing required config keys in {prefix}: {missing}")

@@ -3,6 +3,7 @@
 "initial_level": 1240,  # Initial water level (m)
 "max_turbine_discharge": 2340,  # Outflow capacity of turbines (m3/s)
 "max_power": 4200000,  # Installed capacity (kW)
-"firm_power": 1854000  # Firm output of turbines (kW)
+"firm_power": 1854000,  # Firm output of turbines (kW)
 "power_coefficient": 8.5,  # Power coefficient
-"delta_t_days": 30.4
+"delta_t_days": 30.4,  # Days per monthly time step
+"inflow_upper_bound": 5000.0  # DQN inflow upper bound for observation normalization (m3/s)

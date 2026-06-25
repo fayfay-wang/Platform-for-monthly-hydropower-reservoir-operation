@@ -42,6 +42,9 @@ class SharedReservoirModel:
         self.max_power = float(self._get_param("max_power"))
         self.firm_power = float(self._get_param("firm_power"))
         self.power_coefficient = float(self._get_param("power_coefficient"))
+        self.inflow_upper_bound = float(
+            self._get_param("inflow_upper_bound", default=5000.0)
+        )
 
         # Optional shared temporal parameter
         self.delta_t_days = float(self._get_param("delta_t_days", default=30.4))

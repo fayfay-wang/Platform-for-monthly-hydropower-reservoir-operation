@@ -11,19 +11,14 @@ algorithm evaluation CSV files, including:
 
 Design choices
 --------------
-- The script reads only the standardized evaluation results under
+- The script reads standardized evaluation results under
   outputs/evaluation/{algorithm}.
-- Because interactive file selection has been removed, the script automatically
-  selects one evaluation CSV for each algorithm by optimizing the consistency of
-  month-based reliability across algorithms.
-- The preferred combination is the one in which all algorithms satisfy the
-  reliability floor (default: 90%) and the variance of the four reliability
-  values is minimized.
-- If multiple combinations are tied, the script further prefers the one with
-  the smallest reliability range and then the smallest sum of lambda values.
-- If no combination satisfies the reliability floor for all algorithms, the
-  script falls back to all available combinations and still chooses the one with
-  the smallest reliability variance.
+- One evaluation CSV is selected for each algorithm through an adaptive
+  reliability candidate pool.
+- Candidate pools are filtered by reliability coverage rules when enough files
+  satisfy the corresponding reliability floor for every algorithm.
+- Candidate combinations are ranked by reliability target proximity,
+  cross-algorithm reliability consistency, and lambda parsimony.
 - The visualization outputs are saved under outputs/visualization.
 """
 
@@ -71,13 +66,15 @@ PANEL_FACE_COLORS = [
 
 RELIABILITY_DRY_QUANTILE = 0.2
 RELIABILITY_WET_QUANTILE = 0.8
-# Preferred floor for selecting high-reliability baseline scenarios.
-# The script first tries to select candidates with reliability >= 85%.
-RELIABILITY_FLOOR_PCT = 85.0
 
-# If at least one algorithm has no candidate >= 85%, fall back to this lower
-# floor rather than silently selecting very low-reliability cases.
-RELIABILITY_FALLBACK_FLOOR_PCT = 80.0
+# Candidate-pool rules: (reliability floor %, minimum candidate ratio).
+RELIABILITY_FLOOR_RULES: List[Tuple[float, float]] = [
+    (80.0, 0.30),
+    (60.0, 0.50),
+]
+
+# Target reliability is set slightly above the active floor when a floor is used.
+TARGET_RELIABILITY_MARGIN_PCT = 5.0
 
 
 def infer_year_month_from_month_index(month_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
@@ -153,120 +150,323 @@ def collect_eval_candidates(algo_label: str, eval_dir: Path, firm_power: float) 
     return records
 
 
+def choose_adaptive_reliability_floor(
+    raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
+    floor_rules: List[Tuple[float, float]],
+) -> Tuple[float | None, Dict[float, Dict[str, float]]]:
+    """
+    Choose a reliability floor according to candidate availability.
+
+    For each reliability floor, the share of candidates satisfying the floor is
+    computed separately for each algorithm. A floor is activated only when every
+    algorithm meets the required candidate ratio and has at least one valid file.
+    """
+    ratio_record: Dict[float, Dict[str, float]] = {}
+
+    for floor_pct, min_ratio in floor_rules:
+        ratios: Dict[str, float] = {}
+        floor_is_available = True
+
+        for algo_label in ALGO_ORDER:
+            candidates = raw_candidate_map[algo_label]
+            n_total = len(candidates)
+            n_valid = sum(1 for item in candidates if item[2] >= floor_pct)
+            ratio = n_valid / n_total if n_total > 0 else 0.0
+            ratios[algo_label] = ratio
+
+            if n_valid == 0 or ratio < min_ratio:
+                floor_is_available = False
+
+        ratio_record[floor_pct] = ratios
+
+        if floor_is_available:
+            return floor_pct, ratio_record
+
+    return None, ratio_record
+
+
+def _candidate_in_interval(reliability_pct: float, lower: float, upper: float) -> bool:
+    if upper >= 100.0:
+        return lower <= reliability_pct <= upper
+    return lower <= reliability_pct < upper
+
+
+def _local_reference_tolerance(reference_values: np.ndarray, idx: int, max_tolerance: float) -> float:
+    """
+    Compute a local matching tolerance around a reference reliability value.
+    """
+    if len(reference_values) <= 1:
+        return float(max_tolerance)
+
+    gaps = []
+    if idx > 0:
+        gaps.append(reference_values[idx] - reference_values[idx - 1])
+    if idx < len(reference_values) - 1:
+        gaps.append(reference_values[idx + 1] - reference_values[idx])
+
+    local_gap = float(np.nanmean(gaps)) if gaps else float(max_tolerance)
+    local_tol = max(1.0, local_gap * 1.25)
+    return float(min(max_tolerance, local_tol))
+
+
+def _find_nearest_match_for_reference(
+    ref_reliability: float,
+    ref_idx: int,
+    reference_values: np.ndarray,
+    interval_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
+    max_tolerance: float,
+) -> Dict[str, object]:
+    """
+    Match each algorithm to the nearest candidate around one reference reliability.
+    """
+    adaptive_tol = _local_reference_tolerance(reference_values, ref_idx, max_tolerance)
+    selected: Dict[str, Path] = {}
+    reliabilities: Dict[str, float | None] = {}
+    lambdas: Dict[str, float | None] = {}
+    diffs: Dict[str, float | None] = {}
+
+    for algo_label in ALGO_ORDER:
+        candidates = interval_candidate_map.get(algo_label, [])
+        if not candidates:
+            reliabilities[algo_label] = None
+            lambdas[algo_label] = None
+            diffs[algo_label] = None
+            continue
+
+        nearest = min(candidates, key=lambda item: (abs(item[2] - ref_reliability), item[1], item[0].name.lower()))
+        diff = abs(nearest[2] - ref_reliability)
+
+        if diff <= adaptive_tol:
+            selected[algo_label] = nearest[0]
+            reliabilities[algo_label] = float(nearest[2])
+            lambdas[algo_label] = float(nearest[1])
+            diffs[algo_label] = float(diff)
+        else:
+            reliabilities[algo_label] = None
+            lambdas[algo_label] = None
+            diffs[algo_label] = None
+
+    finite_diffs = [value for value in diffs.values() if value is not None]
+    finite_lambdas = [value for value in lambdas.values() if value is not None and np.isfinite(value)]
+    finite_reliabilities = [value for value in reliabilities.values() if value is not None]
+
+    return {
+        "reference": float(ref_reliability),
+        "adaptive_tolerance": float(adaptive_tol),
+        "selected": selected,
+        "reliabilities": reliabilities,
+        "lambdas": lambdas,
+        "diffs": diffs,
+        "n_matched": len(selected),
+        "max_diff": float(max(finite_diffs)) if finite_diffs else float("inf"),
+        "mean_diff": float(np.mean(finite_diffs)) if finite_diffs else float("inf"),
+        "lambda_sum": float(np.sum(finite_lambdas)) if finite_lambdas else float("inf"),
+        "mean_reliability": float(np.mean(finite_reliabilities)) if finite_reliabilities else float("nan"),
+    }
+
+
+def _match_interval_by_adaptive_nearest_neighbor(
+    raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
+    lower: float,
+    upper: float,
+    tolerance_sequence: Iterable[float],
+) -> Dict[str, object] | None:
+    """
+    Search one reliability interval using adaptive nearest-neighbor matching.
+    """
+    interval_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
+
+    for algo_label in ALGO_ORDER:
+        interval_candidate_map[algo_label] = [
+            item for item in raw_candidate_map[algo_label]
+            if _candidate_in_interval(item[2], lower, upper)
+        ]
+
+    all_values = []
+    for algo_label in ALGO_ORDER:
+        all_values.extend([item[2] for item in interval_candidate_map[algo_label]])
+
+    if not all_values:
+        print(f"No candidates in reliability interval [{lower:.0f}, {upper:.0f}].")
+        return None
+
+    reference_values = np.array(sorted(set(round(float(value), 6) for value in all_values)), dtype=float)
+
+    print(f"Adaptive nearest-neighbor matching in [{lower:.0f}, {upper:.0f}]%:")
+    for algo_label in ALGO_ORDER:
+        print(f"  {algo_label}: {len(interval_candidate_map[algo_label])} candidates")
+
+    best_partial: Dict[str, object] | None = None
+
+    for max_tolerance in tolerance_sequence:
+        records = [
+            _find_nearest_match_for_reference(
+                ref_reliability=ref_value,
+                ref_idx=idx,
+                reference_values=reference_values,
+                interval_candidate_map=interval_candidate_map,
+                max_tolerance=max_tolerance,
+            )
+            for idx, ref_value in enumerate(reference_values)
+        ]
+
+        full_records = [record for record in records if record["n_matched"] == len(ALGO_ORDER)]
+
+        if records:
+            local_best_partial = max(
+                records,
+                key=lambda item: (
+                    item["n_matched"],
+                    -item["max_diff"],
+                    -item["mean_diff"],
+                    -item["lambda_sum"],
+                ),
+            )
+            if best_partial is None or local_best_partial["n_matched"] > best_partial["n_matched"]:
+                best_partial = local_best_partial
+
+        print(
+            f"  tolerance <= {max_tolerance:.1f}% | "
+            f"full matches: {len(full_records)}"
+        )
+
+        if full_records:
+            best = min(
+                full_records,
+                key=lambda item: (
+                    item["max_diff"],
+                    item["mean_diff"],
+                    item["lambda_sum"],
+                    -item["mean_reliability"],
+                ),
+            )
+
+            print(
+                f"  selected reference = {best['reference']:.2f}% | "
+                f"adaptive tolerance = {best['adaptive_tolerance']:.2f}% | "
+                f"max diff = {best['max_diff']:.2f}% | "
+                f"mean diff = {best['mean_diff']:.2f}%"
+            )
+            return best
+
+    if best_partial is not None:
+        print(
+            f"  no full match in [{lower:.0f}, {upper:.0f}]%; "
+            f"best partial match covers {best_partial['n_matched']}/{len(ALGO_ORDER)} algorithms"
+        )
+
+    return None
+
+
+def _fallback_nearest_common_reliability(
+    raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
+) -> Dict[str, Path]:
+    """
+    Select nearest candidates around the median reliability as a fallback.
+    """
+    all_reliabilities = [
+        item[2]
+        for algo_label in ALGO_ORDER
+        for item in raw_candidate_map[algo_label]
+    ]
+    if not all_reliabilities:
+        raise ValueError("No evaluation candidates are available.")
+
+    reference = float(np.nanmedian(all_reliabilities))
+    selected: Dict[str, Path] = {}
+
+    print(
+        "No full segmented adaptive match was found. "
+        f"Using nearest candidates around the median reliability ({reference:.2f}%)."
+    )
+
+    for algo_label in ALGO_ORDER:
+        candidates = raw_candidate_map[algo_label]
+        nearest = min(candidates, key=lambda item: (abs(item[2] - reference), item[1], item[0].name.lower()))
+        selected[algo_label] = nearest[0]
+        print(
+            f"  {algo_label}: {nearest[0].name} | "
+            f"reliability = {nearest[2]:.2f}% | lambda = {nearest[1]:.2f}"
+        )
+
+    return selected
+
+
 def select_best_eval_file_combination(
     outputs_dir: Path,
     firm_power: float,
-    reliability_floor_pct: float = RELIABILITY_FLOOR_PCT,
-    fallback_floor_pct: float = RELIABILITY_FALLBACK_FLOOR_PCT,
+    floor_rules: List[Tuple[float, float]] | None = None,
 ) -> Dict[str, Path]:
     """
-    Select one evaluation CSV per algorithm with preference for high reliability.
-
-    Selection rule:
-    1) first try to keep only candidates with reliability >= reliability_floor_pct
-       (default: 85%);
-    2) if at least one algorithm has no candidate above this preferred floor,
-       fall back to fallback_floor_pct (default: 80%);
-    3) among feasible cross-algorithm combinations, prefer:
-       - larger minimum reliability across algorithms;
-       - larger mean reliability across algorithms;
-       - smaller reliability variance;
-       - smaller reliability range;
-       - smaller sum of lambda values.
-
-    This avoids selecting a low-reliability combination merely because the four
-    algorithms have similar reliability values.
+    Select one evaluation CSV per algorithm using segmented adaptive nearest-neighbor matching.
     """
+    if floor_rules is None:
+        floor_rules = RELIABILITY_FLOOR_RULES
+
     raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
-    preferred_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
 
     for algo_label in ALGO_ORDER:
         algo_dir_name = ALGO_DIR_MAP[algo_label]
         eval_dir = outputs_dir / "evaluation" / algo_dir_name
-        raw_candidates = collect_eval_candidates(algo_label, eval_dir, firm_power=firm_power)
-        raw_candidate_map[algo_label] = raw_candidates
-        preferred_candidate_map[algo_label] = [
-            item for item in raw_candidates
-            if item[2] >= reliability_floor_pct
-        ]
-
-    use_preferred_floor = all(
-        len(preferred_candidate_map[algo_label]) > 0
-        for algo_label in ALGO_ORDER
-    )
-    active_floor = reliability_floor_pct if use_preferred_floor else fallback_floor_pct
-
-    if not use_preferred_floor:
-        print(
-            f"Warning: not every algorithm has a candidate with reliability >= "
-            f"{reliability_floor_pct:.2f}%. Falling back to >= {fallback_floor_pct:.2f}%."
+        raw_candidate_map[algo_label] = collect_eval_candidates(
+            algo_label,
+            eval_dir,
+            firm_power=firm_power,
         )
 
-    candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
-    for algo_label in ALGO_ORDER:
-        raw_candidates = raw_candidate_map[algo_label]
-        valid_candidates = [
-            item for item in raw_candidates
-            if item[2] >= active_floor
-        ]
+    print("Adaptive reliability coverage:")
+    floor_availability: Dict[float, bool] = {}
 
-        if not valid_candidates:
-            best_candidate = max(raw_candidates, key=lambda item: item[2])
-            raise ValueError(
-                f"No evaluation CSV for {algo_label} satisfies the active reliability floor "
-                f">= {active_floor:.2f}%. "
-                f"Best available file is {best_candidate[0].name} "
-                f"with reliability = {best_candidate[2]:.2f}%."
-            )
+    for floor_pct, min_ratio in floor_rules:
+        floor_is_available = True
+        print(f"  Floor >= {floor_pct:.2f}% | required candidate ratio = {min_ratio * 100:.1f}%")
 
-        candidate_map[algo_label] = valid_candidates
+        for algo_label in ALGO_ORDER:
+            candidates = raw_candidate_map[algo_label]
+            n_total = len(candidates)
+            n_valid = sum(1 for item in candidates if item[2] >= floor_pct)
+            ratio = n_valid / n_total if n_total > 0 else 0.0
+            print(f"    {algo_label}: {ratio * 100:.1f}%")
 
-    algo_labels = list(ALGO_ORDER)
-    all_products = product(*(candidate_map[algo] for algo in algo_labels))
+            if n_valid == 0 or ratio < min_ratio:
+                floor_is_available = False
 
-    feasible: List[Dict[str, object]] = []
+        floor_availability[floor_pct] = floor_is_available
 
-    for combo in all_products:
-        reliabilities = np.array([item[2] for item in combo], dtype=float)
-        lambdas = np.array([item[1] for item in combo], dtype=float)
-        selected = {algo_labels[i]: combo[i][0] for i in range(len(algo_labels))}
+    tolerance_sequence = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    interval_plan: List[Tuple[float, float]] = []
 
-        feasible.append(
-            {
-                "min_reliability": float(np.min(reliabilities)),
-                "mean_reliability": float(np.mean(reliabilities)),
-                "variance": float(np.var(reliabilities)),
-                "range": float(np.max(reliabilities) - np.min(reliabilities)),
-                "lambda_sum": float(np.sum(lambdas)),
-                "selected": selected,
-                "reliabilities": {algo_labels[i]: float(combo[i][2]) for i in range(len(algo_labels))},
-            }
+    if floor_availability.get(80.0, False):
+        interval_plan.append((80.0, 100.0))
+
+    interval_plan.append((60.0, 80.0))
+
+    for lower, upper in interval_plan:
+        match = _match_interval_by_adaptive_nearest_neighbor(
+            raw_candidate_map=raw_candidate_map,
+            lower=lower,
+            upper=upper,
+            tolerance_sequence=tolerance_sequence,
         )
 
-    best = max(
-        feasible,
-        key=lambda item: (
-            item["min_reliability"],       # maximize the worst algorithm's reliability
-            item["mean_reliability"],      # maximize average reliability
-            -item["variance"],             # minimize reliability variance
-            -item["range"],                # minimize reliability range
-            -item["lambda_sum"],           # minimize lambda sum
-        ),
-    )
+        if match is None:
+            continue
 
-    print(
-        "Selection objective: "
-        f"active_floor = {active_floor:.2f}%, "
-        f"min_reliability = {best['min_reliability']:.2f}%, "
-        f"mean_reliability = {best['mean_reliability']:.2f}%, "
-        f"variance = {best['variance']:.4f}, "
-        f"range = {best['range']:.2f}%"
-    )
-    print("Selected reliability by algorithm:")
-    for algo_label in ALGO_ORDER:
-        print(f"  {algo_label}: {best['reliabilities'][algo_label]:.2f}%")
+        selected = match["selected"]
+        if len(selected) == len(ALGO_ORDER):
+            print("Selected reliability by algorithm:")
+            for algo_label in ALGO_ORDER:
+                reliability = match["reliabilities"][algo_label]
+                diff = match["diffs"][algo_label]
+                lambda_value = match["lambdas"][algo_label]
+                print(
+                    f"  {algo_label}: {reliability:.2f}% "
+                    f"(diff = {diff:.2f}%, lambda = {lambda_value:.2f})"
+                )
+            return selected
 
-    return best["selected"]
+    return _fallback_nearest_common_reliability(raw_candidate_map)
+
 
 def load_single_result(algo_label: str, csv_path: Path) -> pd.DataFrame:
     """
@@ -490,17 +690,48 @@ def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path) -> None:
 
     annual = annual.merge(pd.DataFrame(ri_list), on=["algo", "year"], how="left")
 
-    size_min, size_max = 30, 220
-    values = annual["ramping_index"].to_numpy()
-    v_min = np.nanmin(values) if np.isfinite(values).any() else 0.0
-    v_max = np.nanmax(values) if np.isfinite(values).any() else 1.0
-    annual["_size"] = np.interp(values, [v_min, v_max], [size_min, size_max]) if v_max > v_min else size_min
+    # Average repeated annual inflow cases within each algorithm.
+    annual["inflow_key"] = pd.to_numeric(annual["inflow_mean"], errors="coerce").round(6)
+    annual_plot = (
+        annual.groupby(["algo", "inflow_key"], as_index=False)
+        .agg(
+            inflow_mean=("inflow_mean", "mean"),
+            energy_sum=("energy_sum", "mean"),
+            ramping_index=("ramping_index", "mean"),
+        )
+        .sort_values(["algo", "inflow_mean"])
+        .reset_index(drop=True)
+    )
+
+    def ramping_to_size(value: float) -> float:
+        if not np.isfinite(value):
+            return 12.0
+        if value <= 3.0:
+            return 10.0
+        if value <= 6.0:
+            return 26.0
+        if value <= 9.0:
+            return 64.0
+        if value <= 12.0:
+            return 120.0
+        return 190.0
+
+    annual_plot["_size"] = annual_plot["ramping_index"].apply(ramping_to_size)
+    values = annual_plot["ramping_index"].to_numpy(dtype=float)
+
+    size_legend_items = [
+        ("≤3 m/month", 10.0),
+        ("3–6 m/month", 26.0),
+        ("6–9 m/month", 64.0),
+        ("9–12 m/month", 120.0),
+        (">12 m/month", 190.0),
+    ]
 
     with plt.rc_context({"font.sans-serif": ["DejaVu Sans", "Arial"], "axes.unicode_minus": False}):
         fig, ax = plt.subplots(figsize=(9.2, 5.8), dpi=600)
 
-        for algo in get_algos_present(annual):
-            subset = annual[annual["algo"] == algo]
+        for algo in get_algos_present(annual_plot):
+            subset = annual_plot[annual_plot["algo"] == algo]
             ax.scatter(
                 subset["inflow_mean"],
                 subset["energy_sum"],
@@ -509,11 +740,11 @@ def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path) -> None:
                 alpha=0.68,
                 label=algo,
                 edgecolors="black",
-                linewidths=0.6,
+                linewidths=0.45,
             )
 
         ax.set_xlabel("Mean Annual Inflow (m³/s)", fontsize=LABEL_FT)
-        ax.set_ylabel("Total Annual Electricity (GWh)", fontsize=LABEL_FT)
+        ax.set_ylabel("Mean Annual Electricity (GWh)", fontsize=LABEL_FT)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.tick_params(axis="both", labelsize=TICK_FT)
 
@@ -527,13 +758,11 @@ def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path) -> None:
         ax.add_artist(algo_legend)
 
         if np.isfinite(values).any():
-            ri_ticks = np.array([v_min, np.nanmedian(values), v_max], dtype=float)
-            size_ticks = np.interp(ri_ticks, [v_min, v_max], [size_min, size_max]) if v_max > v_min else np.full(3, size_min)
             size_handles = [
-                ax.scatter([], [], s=size, edgecolors="black", facecolors="none", linewidths=0.9)
-                for size in size_ticks
+                ax.scatter([], [], s=size, color="0.7", edgecolors="black", linewidths=0.45)
+                for _, size in size_legend_items
             ]
-            size_labels = [f"{ri:.2f} m/month" for ri in ri_ticks]
+            size_labels = [label for label, _ in size_legend_items]
             size_legend = ax.legend(
                 size_handles,
                 size_labels,
@@ -914,7 +1143,7 @@ def main() -> None:
     selected_files = select_best_eval_file_combination(
         outputs_dir=outputs_dir,
         firm_power=reservoir.firm_power,
-        reliability_floor_pct=RELIABILITY_FLOOR_PCT,
+        floor_rules=RELIABILITY_FLOOR_RULES,
     )
 
     frames: List[pd.DataFrame] = []
