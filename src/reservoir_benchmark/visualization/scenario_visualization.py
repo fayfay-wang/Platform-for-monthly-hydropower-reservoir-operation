@@ -5,27 +5,28 @@ Scenario-level visualization for the unified reservoir operation framework.
 This script builds fixed scenario comparison outputs from the standardized
 algorithm evaluation CSV files, including:
 1) an energy-inflow-level bubble plot,
-2) representative-year time-series plots,
-3) a 2×2 monthly distribution figure, and
-4) a LaTeX summary table corresponding to the monthly comparison statistics.
+2) an energy-inflow envelope comparison plot,
+3) representative-year time-series plots,
+4) a 2×2 monthly distribution figure, and
+5) a LaTeX summary table corresponding to the monthly comparison statistics.
 
 Design choices
 --------------
 - The script reads standardized evaluation results under
   outputs/evaluation/{algorithm}.
-- One evaluation CSV is selected for each algorithm through an adaptive
-  reliability candidate pool.
-- Candidate pools are filtered by reliability coverage rules when enough files
-  satisfy the corresponding reliability floor for every algorithm.
-- Candidate combinations are ranked by reliability target proximity,
-  cross-algorithm reliability consistency, and lambda parsimony.
+- One evaluation CSV is selected for each algorithm through a reliability
+  common-window search across the method-specific penalty sweeps.
+- High-reliability candidates are prioritized whenever every algorithm has
+  at least one candidate in the high-reliability interval.
+- Candidate combinations are ranked primarily by cross-algorithm reliability
+  consistency, then by mean reliability and lambda parsimony.
 - The visualization outputs are saved under outputs/visualization.
 """
 
 import re
+from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
-from itertools import product
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,9 +34,30 @@ import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
+try:
+    from scipy.interpolate import PchipInterpolator
+except ImportError:  # Keep the plotting script usable even when SciPy is unavailable.
+    PchipInterpolator = None
+
 from reservoir_benchmark.shared.io_utils import load_monthly_inflows_from_excel
 from reservoir_benchmark.shared.project_paths import get_data_dir, get_outputs_dir
 from reservoir_benchmark.shared.reservoir_model import SharedReservoirModel
+
+import matplotlib as mpl
+
+FONT_RC = {
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "font.sans-serif": ["Times New Roman"],
+    "mathtext.fontset": "custom",
+    "mathtext.rm": "Times New Roman",
+    "mathtext.it": "Times New Roman:italic",
+    "mathtext.bf": "Times New Roman:bold",
+    "axes.unicode_minus": False,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+}
+mpl.rcParams.update(FONT_RC)
 
 ALGO_DIR_MAP: Dict[str, str] = {
     "DDP": "ddp",
@@ -45,7 +67,6 @@ ALGO_DIR_MAP: Dict[str, str] = {
 }
 ALGO_ORDER: List[str] = ["DDP", "SDP", "ISO-SURF", "DQN"]
 
-TITLE_FT = 16
 LABEL_FT = 14
 TICK_FT = 12
 LEGEND_FT = 12
@@ -67,15 +88,18 @@ PANEL_FACE_COLORS = [
 RELIABILITY_DRY_QUANTILE = 0.2
 RELIABILITY_WET_QUANTILE = 0.8
 
-# Candidate-pool rules: (reliability floor %, minimum candidate ratio).
+# Candidate-pool diagnostics: (reliability floor %, historical minimum candidate ratio).
 RELIABILITY_FLOOR_RULES: List[Tuple[float, float]] = [
     (80.0, 0.30),
     (60.0, 0.50),
 ]
 
-# Target reliability is set slightly above the active floor when a floor is used.
-TARGET_RELIABILITY_MARGIN_PCT = 5.0
 
+MONTH_COLUMNS = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+MONTH_TO_INDEX = {name: i + 1 for i, name in enumerate(MONTH_COLUMNS)}
 
 def infer_year_month_from_month_index(month_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
     """
@@ -265,14 +289,129 @@ def _find_nearest_match_for_reference(
     }
 
 
-def _match_interval_by_adaptive_nearest_neighbor(
+def _build_match_record(
+    combo: Tuple[Tuple[Path, float, float], ...],
+    reference: float | None = None,
+) -> Dict[str, object]:
+    """
+    Build a standard match record from one candidate combination.
+
+    Each candidate tuple is (csv_path, lambda_value, reliability_pct), ordered
+    consistently with ALGO_ORDER.
+    """
+    selected: Dict[str, Path] = {}
+    reliabilities: Dict[str, float] = {}
+    lambdas: Dict[str, float] = {}
+
+    for algo_label, item in zip(ALGO_ORDER, combo):
+        selected[algo_label] = item[0]
+        lambdas[algo_label] = float(item[1])
+        reliabilities[algo_label] = float(item[2])
+
+    reliability_values = np.array([reliabilities[algo] for algo in ALGO_ORDER], dtype=float)
+    lambda_values = np.array(
+        [lambdas[algo] for algo in ALGO_ORDER if np.isfinite(lambdas[algo])],
+        dtype=float,
+    )
+
+    if reference is None:
+        reference_value = float(np.mean(reliability_values))
+    else:
+        reference_value = float(reference)
+
+    diffs = {
+        algo_label: float(abs(reliabilities[algo_label] - reference_value))
+        for algo_label in ALGO_ORDER
+    }
+
+    min_reliability = float(np.min(reliability_values))
+    max_reliability = float(np.max(reliability_values))
+    reliability_range = float(max_reliability - min_reliability)
+    mean_reliability = float(np.mean(reliability_values))
+    max_diff = float(max(diffs.values()))
+    mean_diff = float(np.mean(list(diffs.values())))
+    lambda_sum = float(np.sum(lambda_values)) if len(lambda_values) else float("inf")
+
+    return {
+        "reference": reference_value,
+        "selected": selected,
+        "reliabilities": reliabilities,
+        "lambdas": lambdas,
+        "diffs": diffs,
+        "n_matched": len(selected),
+        "min_reliability": min_reliability,
+        "max_reliability": max_reliability,
+        "reliability_range": reliability_range,
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "lambda_sum": lambda_sum,
+        "mean_reliability": mean_reliability,
+    }
+
+
+def _match_sort_key(
+    match: Dict[str, object],
+    prefer_higher_reliability: bool = False,
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Ranking rule for scenario selection.
+
+    When a tolerance-constrained high-reliability window exists, the first goal
+    is to keep all algorithms as reliable as possible, so the ranking maximizes
+    the minimum selected reliability and then the mean selected reliability.
+    Within that high-reliability feasible set, the reliability range remains the
+    next key comparability criterion.
+
+    For lower-reliability fallback or no-tolerance cases, the ranking first
+    minimizes the reliability range.
+    """
+    if prefer_higher_reliability:
+        return (
+            -float(match["min_reliability"]),
+            -float(match["mean_reliability"]),
+            float(match["reliability_range"]),
+            float(match["max_diff"]),
+            float(match["mean_diff"]),
+            float(match["lambda_sum"]),
+        )
+
+    return (
+        float(match["reliability_range"]),
+        float(match["max_diff"]),
+        float(match["mean_diff"]),
+        -float(match["mean_reliability"]),
+        float(match["lambda_sum"]),
+        -float(match["min_reliability"]),
+    )
+
+
+def _select_best_interval_common_window(
     raw_candidate_map: Dict[str, List[Tuple[Path, float, float]]],
     lower: float,
     upper: float,
-    tolerance_sequence: Iterable[float],
+    max_reliability_range: float | None = None,
+    force_interval: bool = False,
+    exact_combo_limit: int = 10_000_000,
+    prefer_higher_reliability_in_limit: bool = False,
 ) -> Dict[str, object] | None:
     """
-    Search one reliability interval using adaptive nearest-neighbor matching.
+    Select one candidate per algorithm within a reliability interval.
+
+    This function replaces the previous reference-point nearest-neighbor gate.
+    It searches for the best common reliability window, where the main window
+    width is max(selected reliability) - min(selected reliability). This avoids
+    missing valid comparable points when candidate reliabilities are dense and
+    the local adaptive tolerance becomes too restrictive.
+
+    If max_reliability_range is provided, the function first tries to return a
+    combination whose reliability range is within that limit. If
+    prefer_higher_reliability_in_limit is True, feasible combinations are ranked
+    by the highest minimum reliability before secondary comparability criteria.
+    When force_interval is True, it still returns the best interval-internal
+    combination even if the
+    range exceeds the requested limit; this is used only for the high-reliability
+    interval so that the final selection does not fall back to lower reliability
+    while high-reliability candidates exist for all algorithms.
     """
     interval_candidate_map: Dict[str, List[Tuple[Path, float, float]]] = {}
 
@@ -282,80 +421,144 @@ def _match_interval_by_adaptive_nearest_neighbor(
             if _candidate_in_interval(item[2], lower, upper)
         ]
 
-    all_values = []
+    print(f"Common-window matching in [{lower:.0f}, {upper:.0f}]%:")
     for algo_label in ALGO_ORDER:
-        all_values.extend([item[2] for item in interval_candidate_map[algo_label]])
+        candidates = interval_candidate_map[algo_label]
+        if candidates:
+            rel_values = [item[2] for item in candidates]
+            print(
+                f"  {algo_label}: {len(candidates)} candidates | "
+                f"reliability range = {min(rel_values):.2f}--{max(rel_values):.2f}%"
+            )
+        else:
+            print(f"  {algo_label}: 0 candidates")
 
-    if not all_values:
-        print(f"No candidates in reliability interval [{lower:.0f}, {upper:.0f}].")
+    missing_algos = [
+        algo_label
+        for algo_label in ALGO_ORDER
+        if len(interval_candidate_map[algo_label]) == 0
+    ]
+    if missing_algos:
+        print(
+            f"  interval [{lower:.0f}, {upper:.0f}]% is unavailable because "
+            f"these algorithms have no candidates: {missing_algos}"
+        )
         return None
 
-    reference_values = np.array(sorted(set(round(float(value), 6) for value in all_values)), dtype=float)
+    candidate_lists = [interval_candidate_map[algo_label] for algo_label in ALGO_ORDER]
+    total_combinations = int(np.prod([len(items) for items in candidate_lists]))
+    print(f"  candidate combinations to check: {total_combinations}")
 
-    print(f"Adaptive nearest-neighbor matching in [{lower:.0f}, {upper:.0f}]%:")
+    best_any: Dict[str, object] | None = None
+    best_within_limit: Dict[str, object] | None = None
+
+    if total_combinations <= exact_combo_limit:
+        for combo in product(*candidate_lists):
+            match = _build_match_record(combo)
+            key_any = _match_sort_key(match, prefer_higher_reliability=False)
+            key_within = _match_sort_key(
+                match,
+                prefer_higher_reliability=prefer_higher_reliability_in_limit,
+            )
+
+            if best_any is None or key_any < _match_sort_key(best_any, prefer_higher_reliability=False):
+                best_any = match
+
+            if max_reliability_range is None or match["reliability_range"] <= max_reliability_range:
+                if (
+                    best_within_limit is None
+                    or key_within < _match_sort_key(
+                        best_within_limit,
+                        prefer_higher_reliability=prefer_higher_reliability_in_limit,
+                    )
+                ):
+                    best_within_limit = match
+    else:
+        print(
+            f"  exact enumeration skipped because {total_combinations} combinations "
+            f"exceed exact_combo_limit={exact_combo_limit}; using reference scan."
+        )
+        reference_values = sorted(
+            set(
+                round(float(item[2]), 6)
+                for candidates in candidate_lists
+                for item in candidates
+            )
+        )
+
+        for ref_reliability in reference_values:
+            combo = tuple(
+                min(
+                    candidates,
+                    key=lambda item: (
+                        abs(item[2] - ref_reliability),
+                        item[1],
+                        item[0].name.lower(),
+                    ),
+                )
+                for candidates in candidate_lists
+            )
+            match = _build_match_record(combo, reference=ref_reliability)
+            key_any = _match_sort_key(match, prefer_higher_reliability=False)
+            key_within = _match_sort_key(
+                match,
+                prefer_higher_reliability=prefer_higher_reliability_in_limit,
+            )
+
+            if best_any is None or key_any < _match_sort_key(best_any, prefer_higher_reliability=False):
+                best_any = match
+
+            if max_reliability_range is None or match["reliability_range"] <= max_reliability_range:
+                if (
+                    best_within_limit is None
+                    or key_within < _match_sort_key(
+                        best_within_limit,
+                        prefer_higher_reliability=prefer_higher_reliability_in_limit,
+                    )
+                ):
+                    best_within_limit = match
+
+    if best_any is None:
+        return None
+
+    if max_reliability_range is not None and best_within_limit is None:
+        print(
+            f"  no combination within the requested reliability range "
+            f"<= {max_reliability_range:.2f}%; best available range is "
+            f"{best_any['reliability_range']:.2f}%"
+        )
+        if not force_interval:
+            return None
+        best = best_any
+    else:
+        best = best_within_limit if best_within_limit is not None else best_any
+
+    print(
+        f"  selected common window = "
+        f"{best['min_reliability']:.2f}--{best['max_reliability']:.2f}% | "
+        f"range = {best['reliability_range']:.2f}% | "
+        f"mean reliability = {best['mean_reliability']:.2f}%"
+    )
+    return best
+
+
+def _print_selected_match(match: Dict[str, object]) -> None:
+    """
+    Print the selected reliability, matching difference, and lambda by algorithm.
+    """
+    print("Selected reliability by algorithm:")
+    reliabilities = match["reliabilities"]
+    diffs = match["diffs"]
+    lambdas = match["lambdas"]
+
     for algo_label in ALGO_ORDER:
-        print(f"  {algo_label}: {len(interval_candidate_map[algo_label])} candidates")
-
-    best_partial: Dict[str, object] | None = None
-
-    for max_tolerance in tolerance_sequence:
-        records = [
-            _find_nearest_match_for_reference(
-                ref_reliability=ref_value,
-                ref_idx=idx,
-                reference_values=reference_values,
-                interval_candidate_map=interval_candidate_map,
-                max_tolerance=max_tolerance,
-            )
-            for idx, ref_value in enumerate(reference_values)
-        ]
-
-        full_records = [record for record in records if record["n_matched"] == len(ALGO_ORDER)]
-
-        if records:
-            local_best_partial = max(
-                records,
-                key=lambda item: (
-                    item["n_matched"],
-                    -item["max_diff"],
-                    -item["mean_diff"],
-                    -item["lambda_sum"],
-                ),
-            )
-            if best_partial is None or local_best_partial["n_matched"] > best_partial["n_matched"]:
-                best_partial = local_best_partial
-
+        reliability = reliabilities[algo_label]
+        diff = diffs[algo_label]
+        lambda_value = lambdas[algo_label]
         print(
-            f"  tolerance <= {max_tolerance:.1f}% | "
-            f"full matches: {len(full_records)}"
+            f"  {algo_label}: {reliability:.2f}% "
+            f"(diff from mean = {diff:.2f}%, lambda = {lambda_value:.2f})"
         )
-
-        if full_records:
-            best = min(
-                full_records,
-                key=lambda item: (
-                    item["max_diff"],
-                    item["mean_diff"],
-                    item["lambda_sum"],
-                    -item["mean_reliability"],
-                ),
-            )
-
-            print(
-                f"  selected reference = {best['reference']:.2f}% | "
-                f"adaptive tolerance = {best['adaptive_tolerance']:.2f}% | "
-                f"max diff = {best['max_diff']:.2f}% | "
-                f"mean diff = {best['mean_diff']:.2f}%"
-            )
-            return best
-
-    if best_partial is not None:
-        print(
-            f"  no full match in [{lower:.0f}, {upper:.0f}]%; "
-            f"best partial match covers {best_partial['n_matched']}/{len(ALGO_ORDER)} algorithms"
-        )
-
-    return None
 
 
 def _fallback_nearest_common_reliability(
@@ -376,7 +579,7 @@ def _fallback_nearest_common_reliability(
     selected: Dict[str, Path] = {}
 
     print(
-        "No full segmented adaptive match was found. "
+        "No full segmented common-window match was found. "
         f"Using nearest candidates around the median reliability ({reference:.2f}%)."
     )
 
@@ -398,7 +601,7 @@ def select_best_eval_file_combination(
     floor_rules: List[Tuple[float, float]] | None = None,
 ) -> Dict[str, Path]:
     """
-    Select one evaluation CSV per algorithm using segmented adaptive nearest-neighbor matching.
+    Select one evaluation CSV per algorithm using high-priority common-window matching.
     """
     if floor_rules is None:
         floor_rules = RELIABILITY_FLOOR_RULES
@@ -414,56 +617,74 @@ def select_best_eval_file_combination(
             firm_power=firm_power,
         )
 
-    print("Adaptive reliability coverage:")
-    floor_availability: Dict[float, bool] = {}
+    print("Reliability coverage diagnostics:")
+    floor_has_candidate_for_all: Dict[float, bool] = {}
 
     for floor_pct, min_ratio in floor_rules:
-        floor_is_available = True
-        print(f"  Floor >= {floor_pct:.2f}% | required candidate ratio = {min_ratio * 100:.1f}%")
+        has_candidate_for_all = True
+        print(
+            f"  Floor >= {floor_pct:.2f}% | "
+            f"candidate ratio shown for reference only; "
+            f"minimum-ratio gate disabled"
+        )
 
         for algo_label in ALGO_ORDER:
             candidates = raw_candidate_map[algo_label]
             n_total = len(candidates)
             n_valid = sum(1 for item in candidates if item[2] >= floor_pct)
             ratio = n_valid / n_total if n_total > 0 else 0.0
-            print(f"    {algo_label}: {ratio * 100:.1f}%")
+            print(f"    {algo_label}: {n_valid}/{n_total} candidates ({ratio * 100:.1f}%)")
 
-            if n_valid == 0 or ratio < min_ratio:
-                floor_is_available = False
+            if n_valid == 0:
+                has_candidate_for_all = False
 
-        floor_availability[floor_pct] = floor_is_available
+        floor_has_candidate_for_all[floor_pct] = has_candidate_for_all
 
-    tolerance_sequence = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    interval_plan: List[Tuple[float, float]] = []
+    target_range = 6.0
 
-    if floor_availability.get(80.0, False):
-        interval_plan.append((80.0, 100.0))
-
-    interval_plan.append((60.0, 80.0))
-
-    for lower, upper in interval_plan:
-        match = _match_interval_by_adaptive_nearest_neighbor(
+    # Hard priority: if every algorithm has at least one candidate in [80, 100]%,
+    # the selected combination must come from this interval. The common-window
+    # search then minimizes cross-algorithm reliability spread directly, so it
+    # will not miss valid high-reliability combinations simply because one local
+    # reference-point tolerance was too small.
+    if floor_has_candidate_for_all.get(80.0, False):
+        print(
+            "High-reliability interval [80, 100]% will be searched first "
+            "and kept as the final interval whenever all algorithms have candidates."
+        )
+        high_match = _select_best_interval_common_window(
             raw_candidate_map=raw_candidate_map,
-            lower=lower,
-            upper=upper,
-            tolerance_sequence=tolerance_sequence,
+            lower=80.0,
+            upper=100.0,
+            max_reliability_range=target_range,
+            force_interval=True,
+            prefer_higher_reliability_in_limit=True,
         )
 
-        if match is None:
-            continue
+        if high_match is not None and len(high_match["selected"]) == len(ALGO_ORDER):
+            _print_selected_match(high_match)
+            return high_match["selected"]
 
-        selected = match["selected"]
-        if len(selected) == len(ALGO_ORDER):
-            print("Selected reliability by algorithm:")
-            for algo_label in ALGO_ORDER:
-                reliability = match["reliabilities"][algo_label]
-                diff = match["diffs"][algo_label]
-                lambda_value = match["lambdas"][algo_label]
-                print(
-                    f"  {algo_label}: {reliability:.2f}% "
-                    f"(diff = {diff:.2f}%, lambda = {lambda_value:.2f})"
-                )
-            return selected
+    else:
+        print(
+            "High-reliability interval [80, 100]% skipped because "
+            "at least one algorithm has no candidate in this interval."
+        )
+
+    # Lower reliability is considered only when the high-reliability interval is
+    # not available for all algorithms.
+    low_match = _select_best_interval_common_window(
+        raw_candidate_map=raw_candidate_map,
+        lower=60.0,
+        upper=80.0,
+        max_reliability_range=target_range,
+        force_interval=False,
+        prefer_higher_reliability_in_limit=False,
+    )
+
+    if low_match is not None and len(low_match["selected"]) == len(ALGO_ORDER):
+        _print_selected_match(low_match)
+        return low_match["selected"]
 
     return _fallback_nearest_common_reliability(raw_candidate_map)
 
@@ -519,6 +740,34 @@ def load_reference_inflow_table() -> pd.DataFrame:
     inflow_df["year"] = np.arange(1, len(inflow_df) + 1, dtype=int)
     return inflow_df
 
+def build_reference_inflow_long(reference_inflow_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert the evaluation inflow table to a strict year-month long format.
+    """
+    month_cols = [col for col in MONTH_COLUMNS if col in reference_inflow_df.columns]
+
+    if len(month_cols) != 12:
+        raise ValueError(
+            "Reference inflow table must contain 12 monthly columns: "
+            f"{MONTH_COLUMNS}. Found: {month_cols}"
+        )
+
+    inflow_long = reference_inflow_df.melt(
+        id_vars="year",
+        value_vars=month_cols,
+        var_name="month_label",
+        value_name="inflow",
+    )
+
+    inflow_long["month"] = inflow_long["month_label"].map(MONTH_TO_INDEX).astype(int)
+    inflow_long["inflow"] = pd.to_numeric(inflow_long["inflow"], errors="coerce")
+
+    return (
+        inflow_long
+        .dropna(subset=["inflow"])
+        .sort_values(["year", "month"])
+        .reset_index(drop=True)
+    )
 
 def get_algos_present(df: pd.DataFrame) -> List[str]:
     present = set(pd.unique(df["algo"]))
@@ -616,8 +865,10 @@ def pick_representative_years(reference_inflow_df: pd.DataFrame) -> Dict[str, in
     """
     Select representative dry and wet years from the unified evaluation inflow series.
     """
+    inflow_long = build_reference_inflow_long(reference_inflow_df)
+
     annual = (
-        reference_inflow_df.melt(id_vars="year", var_name="month_label", value_name="inflow")
+        inflow_long
         .groupby("year", as_index=False)["inflow"]
         .mean()
         .sort_values("year")
@@ -666,29 +917,39 @@ def style_boxplot(bp, face: str, edge: str = "#000000", median: str = "#000000")
         med.set_linewidth(1.4)
 
 
-def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path) -> None:
+def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path, reservoir: SharedReservoirModel,
+) -> None:
     """
-    Save the scenario energy-inflow-level bubble plot.
+    Save the scenario energy-inflow-level bubble plot as a 2 x 2 algorithm panel.
+
+    The four algorithms are plotted in separate subplots with identical x/y ranges
+    and tick locations. Bubble size and bubble color jointly represent the mean
+    head class rather than the algorithm identity.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / "scenario_energy_inflow_level_bubble.pdf"
+    png_path = output_dir / "scenario_energy_inflow_level_bubble.png"
+
+    df = all_df.copy()
+
+    power = pd.to_numeric(df["power"], errors="coerce").to_numpy(dtype=float)
+    turbine = pd.to_numeric(df["turbine"], errors="coerce").to_numpy(dtype=float)
+    denom = reservoir.power_coefficient * turbine
+
+    df["head"] = np.where(
+        (denom > 1e-9) & np.isfinite(power),
+        power / denom,
+        np.nan,
+    )
 
     annual = (
-        all_df.groupby(["algo", "year"], as_index=False)
+        df.groupby(["algo", "year"], as_index=False)
         .agg(
             inflow_mean=("inflow", "mean"),
             energy_sum=("energy", "sum"),
+            head_mean=("head", "mean"),
         )
     )
-
-    ri_list = []
-    for (algo, year), group in all_df.groupby(["algo", "year"]):
-        group = group.sort_values("month")
-        levels = pd.to_numeric(group["level"], errors="coerce").to_numpy()
-        ramping_index = float(np.nanmean(np.abs(np.diff(levels)))) if len(levels) >= 2 else 0.0
-        ri_list.append({"algo": algo, "year": year, "ramping_index": ramping_index})
-
-    annual = annual.merge(pd.DataFrame(ri_list), on=["algo", "year"], how="left")
 
     # Average repeated annual inflow cases within each algorithm.
     annual["inflow_key"] = pd.to_numeric(annual["inflow_mean"], errors="coerce").round(6)
@@ -697,88 +958,419 @@ def plot_energy_inflow_level(all_df: pd.DataFrame, output_dir: Path) -> None:
         .agg(
             inflow_mean=("inflow_mean", "mean"),
             energy_sum=("energy_sum", "mean"),
-            ramping_index=("ramping_index", "mean"),
+            head_mean=("head_mean", "mean"),
         )
         .sort_values(["algo", "inflow_mean"])
         .reset_index(drop=True)
     )
 
-    def ramping_to_size(value: float) -> float:
+    annual_plot["energy_twh"] = annual_plot["energy_sum"] / 1000.0  # GWh/yr -> TWh/yr
+
+    x_all = pd.to_numeric(annual_plot["inflow_mean"], errors="coerce").to_numpy(dtype=float)
+    y_all = pd.to_numeric(annual_plot["energy_twh"], errors="coerce").to_numpy(dtype=float)
+
+    x_all = x_all[np.isfinite(x_all)]
+    y_all = y_all[np.isfinite(y_all)]
+
+    if len(x_all) == 0 or len(y_all) == 0:
+        raise ValueError("No valid bubble-plot data available.")
+
+    def compact_limits(values, pad_ratio=0.05, round_to=None):
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        vrange = vmax - vmin
+
+        if np.isclose(vrange, 0.0):
+            vrange = max(abs(vmin), 1.0) * 0.1
+
+        pad = vrange * pad_ratio
+        low = vmin - pad
+        high = vmax + pad
+
+        if round_to is not None and round_to > 0:
+            low = np.floor(low / round_to) * round_to
+            high = np.ceil(high / round_to) * round_to
+
+        return low, high
+
+    xlim = compact_limits(x_all, pad_ratio=0.03, round_to=None)
+    ylim = compact_limits(y_all, pad_ratio=0.03, round_to=None)
+
+    head_values = annual_plot["head_mean"].to_numpy(dtype=float)
+    finite_heads = head_values[np.isfinite(head_values)]
+
+    head_values = annual_plot["head_mean"].to_numpy(dtype=float)
+    finite_heads = head_values[np.isfinite(head_values)]
+
+    if len(finite_heads) == 0:
+        h_min, h_max = 0.0, 1.0
+    else:
+        h_min, h_max = np.nanpercentile(finite_heads, [5, 95])
+        if np.isclose(h_min, h_max):
+            h_min = float(np.nanmin(finite_heads))
+            h_max = float(np.nanmax(finite_heads))
+        if np.isclose(h_min, h_max):
+            h_max = h_min + 1.0
+
+    # Bubble size/color classes: smallest to largest.
+    bubble_colors = ["#1f77b4", "#2ca02c", "#d62728", "#9467bd"]
+    bubble_diameters = np.array([5.0, 9.3, 13.6, 18.0], dtype=float)
+    bubble_sizes = bubble_diameters ** 2
+    head_bin_edges = np.linspace(h_min, h_max, 5)
+
+    def head_to_class(value: float) -> int:
+        """Map mean head to one of four ordered bubble classes."""
         if not np.isfinite(value):
-            return 12.0
-        if value <= 3.0:
-            return 10.0
-        if value <= 6.0:
-            return 26.0
-        if value <= 9.0:
-            return 64.0
-        if value <= 12.0:
-            return 120.0
-        return 190.0
+            return 0
+        clipped = float(np.clip(value, h_min, h_max))
+        class_idx = np.digitize(clipped, head_bin_edges[1:-1], right=False)
+        return int(np.clip(class_idx, 0, 3))
 
-    annual_plot["_size"] = annual_plot["ramping_index"].apply(ramping_to_size)
-    values = annual_plot["ramping_index"].to_numpy(dtype=float)
+    annual_plot["_size_class"] = annual_plot["head_mean"].apply(head_to_class)
+    annual_plot["_size"] = annual_plot["_size_class"].map(lambda idx: bubble_sizes[int(idx)])
+    annual_plot["_bubble_color"] = annual_plot["_size_class"].map(lambda idx: bubble_colors[int(idx)])
 
-    size_legend_items = [
-        ("≤3 m/month", 10.0),
-        ("3–6 m/month", 26.0),
-        ("6–9 m/month", 64.0),
-        ("9–12 m/month", 120.0),
-        (">12 m/month", 190.0),
+    # Use a single global plotting window so that all four panels are directly comparable.
+    x_values = pd.to_numeric(annual_plot["inflow_mean"], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(annual_plot["energy_twh"], errors="coerce").to_numpy(dtype=float)
+    finite_x = x_values[np.isfinite(x_values)]
+    finite_y = y_values[np.isfinite(y_values)]
+
+    if len(finite_x) == 0 or len(finite_y) == 0:
+        raise ValueError("No finite annual inflow or energy values are available for bubble plotting.")
+
+    x_min, x_max = float(np.nanmin(finite_x)), float(np.nanmax(finite_x))
+    y_min, y_max = float(np.nanmin(finite_y)), float(np.nanmax(finite_y))
+    x_pad = (x_max - x_min) * 0.045 if not np.isclose(x_min, x_max) else max(abs(x_min) * 0.045, 1.0)
+    y_pad = (y_max - y_min) * 0.075 if not np.isclose(y_min, y_max) else max(abs(y_min) * 0.075, 0.1)
+    x_lim = (x_min - x_pad, x_max + x_pad)
+    y_lim = (y_min - y_pad, y_max + y_pad)
+
+    panel_items = [
+        ("(a) DDP", "DDP"),
+        ("(b) SDP", "SDP"),
+        ("(c) ISO-SURF", "ISO-SURF"),
+        ("(d) DQN", "DQN"),
     ]
 
-    with plt.rc_context({"font.sans-serif": ["DejaVu Sans", "Arial"], "axes.unicode_minus": False}):
-        fig, ax = plt.subplots(figsize=(9.2, 5.8), dpi=600)
+    legend_labels = [
+        f"{head_bin_edges[i]:.1f}–{head_bin_edges[i + 1]:.1f} m"
+        for i in range(4)
+    ]
 
-        for algo in get_algos_present(annual_plot):
+    with plt.rc_context(FONT_RC):
+        fig, axes = plt.subplots(
+            2,
+            2,
+            figsize=(11.5, 8.2),
+            dpi=600,
+            sharex=True,
+            sharey=True,
+        )
+        axes_flat = axes.ravel()
+
+        for idx, (panel_label, algo) in enumerate(panel_items):
+            ax = axes_flat[idx]
             subset = annual_plot[annual_plot["algo"] == algo]
-            ax.scatter(
-                subset["inflow_mean"],
-                subset["energy_sum"],
-                s=subset["_size"],
-                color=algo_color(algo),
-                alpha=0.68,
-                label=algo,
+
+            if not subset.empty:
+                ax.scatter(
+                    subset["inflow_mean"],
+                    subset["energy_twh"],
+                    s=subset["_size"],
+                    c=subset["_bubble_color"],
+                    alpha=0.68,
+                    edgecolors="black",
+                    linewidths=0.45,
+                )
+
+            ax.set_xlim(x_lim)
+            ax.set_ylim(y_lim)
+            ax.grid(True, linestyle="--", alpha=0.32, linewidth=0.55)
+            ax.tick_params(axis="both", labelsize=TICK_FT)
+            ax.text(
+                0.015,
+                0.985,
+                panel_label,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=13,
+                fontweight="bold",
+            )
+
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.8)
+                spine.set_color("0.35")
+
+        # Keep y-axis information only for the left-column panels.
+        for ax in axes[:, 0]:
+            ax.set_ylabel("Mean Annual Electricity (TWh/yr)", fontsize=LABEL_FT)
+        for ax in axes[:, 1]:
+            ax.set_ylabel("")
+            ax.tick_params(axis="y", left=False, labelleft=False)
+
+        # Keep x-axis information only for the bottom-row panels.
+        for ax in axes[0, :]:
+            ax.set_xlabel("")
+            ax.tick_params(axis="x", bottom=False, labelbottom=False)
+        for ax in axes[1, :]:
+            ax.set_xlabel("Mean Annual Inflow (m³/s)", fontsize=LABEL_FT)
+            ax.tick_params(axis="x", bottom=True, labelbottom=True)
+
+        # Place the only bubble-size/color legend at the figure top to avoid covering data points.
+        legend_ax = axes[0, 1]
+        size_handles = [
+            legend_ax.scatter(
+                [],
+                [],
+                s=bubble_sizes[i],
+                color=bubble_colors[i],
                 edgecolors="black",
                 linewidths=0.45,
+                alpha=0.68,
             )
-
-        ax.set_xlabel("Mean Annual Inflow (m³/s)", fontsize=LABEL_FT)
-        ax.set_ylabel("Mean Annual Electricity (GWh)", fontsize=LABEL_FT)
-        ax.grid(True, linestyle="--", alpha=0.4)
-        ax.tick_params(axis="both", labelsize=TICK_FT)
-
-        algo_legend = ax.legend(
-            fontsize=LEGEND_FT,
-            title="Algorithm",
-            title_fontsize=LEGEND_FT,
+            for i in range(4)
+        ]
+        fig.legend(
+            handles=size_handles,
+            labels=legend_labels,
+            title="Mean head class",
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.995),
+            ncol=4,
             frameon=False,
-            loc="best",
+            fontsize=LEGEND_FT - 1,
+            title_fontsize=LEGEND_FT - 1,
+            labelspacing=0.55,
+            handletextpad=0.8,
+            columnspacing=1.25,
         )
-        ax.add_artist(algo_legend)
 
-        if np.isfinite(values).any():
-            size_handles = [
-                ax.scatter([], [], s=size, color="0.7", edgecolors="black", linewidths=0.45)
-                for _, size in size_legend_items
-            ]
-            size_labels = [label for label, _ in size_legend_items]
-            size_legend = ax.legend(
-                size_handles,
-                size_labels,
-                title=r"Bubble size = mean $|\Delta h_t|$",
-                fontsize=LEGEND_FT,
-                title_fontsize=LEGEND_FT,
-                frameon=False,
-                loc="lower right",
-            )
-            ax.add_artist(size_legend)
-
-        fig.tight_layout()
-        fig.savefig(pdf_path, format="pdf", dpi=600)
+        fig.tight_layout(rect=[0.03, 0.03, 0.98, 0.935], w_pad=1.1, h_pad=1.15)
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight", pad_inches=0.02)
+        fig.savefig(png_path, dpi=600, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
 
     print(f"Saved bubble plot: {pdf_path.resolve()}")
+
+
+def _prepare_unique_xy(x_values: np.ndarray, y_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sort x-y pairs, remove non-finite values, and collapse duplicate x values.
+    """
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if not np.any(mask):
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    grouped = (
+        pd.DataFrame({"x": x[mask], "y": y[mask]})
+        .groupby("x", as_index=False)["y"]
+        .mean()
+        .sort_values("x")
+        .reset_index(drop=True)
+    )
+    return grouped["x"].to_numpy(dtype=float), grouped["y"].to_numpy(dtype=float)
+
+
+def _evaluate_smooth_curve(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    x_grid: np.ndarray,
+) -> np.ndarray:
+    """
+    Evaluate a smooth, shape-preserving curve on a target x grid.
+    """
+    x, y = _prepare_unique_xy(x_values, y_values)
+    if len(x) == 0:
+        return np.full_like(x_grid, np.nan, dtype=float)
+    if len(x) == 1:
+        return np.full_like(x_grid, y[0], dtype=float)
+
+    if PchipInterpolator is not None and len(x) >= 3:
+        interpolator = PchipInterpolator(x, y, extrapolate=False)
+        y_grid = interpolator(x_grid)
+        edge_mask = ~np.isfinite(y_grid)
+        if np.any(edge_mask):
+            y_grid[edge_mask] = np.interp(x_grid[edge_mask], x, y)
+        return np.asarray(y_grid, dtype=float)
+
+    return np.interp(x_grid, x, y)
+
+
+def _build_energy_inflow_envelope(
+    annual_df: pd.DataFrame,
+    algo: str,
+    n_bins: int = 32,
+    lower_quantile: float = 0.10,
+    upper_quantile: float = 0.90,
+) -> pd.DataFrame:
+    """
+    Build a binned annual inflow-energy envelope for one algorithm.
+
+    Quantile bins are used rather than equal-width bins so that each local
+    segment contains a comparable number of annual samples. This stabilizes the
+    envelope when annual inflow values are unevenly distributed.
+    """
+    subset = annual_df[annual_df["algo"] == algo].copy()
+    subset["inflow_mean"] = pd.to_numeric(subset["inflow_mean"], errors="coerce")
+    subset["energy_twh"] = pd.to_numeric(subset["energy_twh"], errors="coerce")
+    subset = subset.dropna(subset=["inflow_mean", "energy_twh"]).sort_values("inflow_mean")
+
+    if len(subset) < 6:
+        return pd.DataFrame(columns=["inflow_mean", "energy_mid", "energy_low", "energy_high", "n"])
+
+    # Keep bins broad enough to form a stable envelope but numerous enough to
+    # retain the nonlinear inflow-generation relationship.
+    bin_count = min(n_bins, max(6, len(subset) // 8))
+    bin_count = min(bin_count, len(subset))
+    subset = subset.reset_index(drop=True)
+    subset["_rank_bin"] = pd.qcut(
+        np.arange(len(subset), dtype=float),
+        q=bin_count,
+        duplicates="drop",
+    )
+
+    envelope = (
+        subset.groupby("_rank_bin", observed=True)
+        .agg(
+            inflow_mean=("inflow_mean", "median"),
+            energy_mid=("energy_twh", "median"),
+            energy_low=("energy_twh", lambda values: values.quantile(lower_quantile)),
+            energy_high=("energy_twh", lambda values: values.quantile(upper_quantile)),
+            n=("energy_twh", "size"),
+        )
+        .dropna(subset=["inflow_mean", "energy_mid", "energy_low", "energy_high"])
+        .sort_values("inflow_mean")
+        .reset_index(drop=True)
+    )
+
+    return envelope
+
+
+def plot_energy_inflow_envelope_comparison(all_df: pd.DataFrame, output_dir: Path) -> None:
+    """
+    Save a wide envelope plot comparing annual inflow-generation relationships.
+
+    Each algorithm is represented by a smooth median annual generation curve and
+    a semi-transparent 10%--90% quantile envelope. This plot complements the
+    four-panel bubble figure by placing all algorithms in one common view.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = output_dir / "scenario_energy_inflow_envelope_comparison.pdf"
+    png_path = output_dir / "scenario_energy_inflow_envelope_comparison.png"
+
+    annual_df = (
+        all_df.groupby(["algo", "year"], as_index=False)
+        .agg(
+            inflow_mean=("inflow", "mean"),
+            energy_sum=("energy", "sum"),
+        )
+        .sort_values(["algo", "inflow_mean"])
+        .reset_index(drop=True)
+    )
+    annual_df["energy_twh"] = annual_df["energy_sum"] / 1000.0  # GWh/yr -> TWh/yr
+    annual_df = annual_df.dropna(subset=["inflow_mean", "energy_twh"])
+
+    algos = get_algos_present(annual_df)
+    if not algos:
+        raise ValueError("No algorithm data available for envelope plotting.")
+
+    x_values = pd.to_numeric(annual_df["inflow_mean"], errors="coerce").to_numpy(dtype=float)
+    y_values = pd.to_numeric(annual_df["energy_twh"], errors="coerce").to_numpy(dtype=float)
+    finite_x = x_values[np.isfinite(x_values)]
+    finite_y = y_values[np.isfinite(y_values)]
+
+    if len(finite_x) == 0 or len(finite_y) == 0:
+        raise ValueError("No finite annual inflow or energy values are available for envelope plotting.")
+
+    x_min, x_max = float(np.nanmin(finite_x)), float(np.nanmax(finite_x))
+    y_min, y_max = float(np.nanmin(finite_y)), float(np.nanmax(finite_y))
+    x_pad = (x_max - x_min) * 0.045 if not np.isclose(x_min, x_max) else max(abs(x_min) * 0.045, 1.0)
+    y_pad = (y_max - y_min) * 0.100 if not np.isclose(y_min, y_max) else max(abs(y_min) * 0.100, 0.1)
+
+    with plt.rc_context(FONT_RC):
+        fig, ax = plt.subplots(figsize=(13.2, 4.4), dpi=600)
+
+        for algo in algos:
+            envelope = _build_energy_inflow_envelope(annual_df, algo=algo)
+            if envelope.empty or len(envelope) < 2:
+                continue
+
+            x_env = envelope["inflow_mean"].to_numpy(dtype=float)
+            x_grid = np.linspace(float(np.nanmin(x_env)), float(np.nanmax(x_env)), 360)
+
+            y_mid = _evaluate_smooth_curve(
+                x_env,
+                envelope["energy_mid"].to_numpy(dtype=float),
+                x_grid,
+            )
+            y_low = _evaluate_smooth_curve(
+                x_env,
+                envelope["energy_low"].to_numpy(dtype=float),
+                x_grid,
+            )
+            y_high = _evaluate_smooth_curve(
+                x_env,
+                envelope["energy_high"].to_numpy(dtype=float),
+                x_grid,
+            )
+
+            y_lower = np.minimum(y_low, y_high)
+            y_upper = np.maximum(y_low, y_high)
+            y_mid = np.clip(y_mid, y_lower, y_upper)
+
+            color = algo_color(algo)
+            ax.fill_between(
+                x_grid,
+                y_lower,
+                y_upper,
+                color=color,
+                alpha=0.16,
+                linewidth=0.0,
+                zorder=1,
+            )
+            ax.plot(x_grid, y_lower, color=color, linewidth=0.8, alpha=0.28, zorder=2)
+            ax.plot(x_grid, y_upper, color=color, linewidth=0.8, alpha=0.28, zorder=2)
+            ax.plot(x_grid, y_mid, color=color, linewidth=2.2, alpha=0.96, label=algo, zorder=3)
+
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xlabel("Mean Annual Inflow (m³/s)", fontsize=LABEL_FT)
+        ax.set_ylabel("Annual Electricity Generation (TWh/yr)", fontsize=LABEL_FT)
+        ax.tick_params(axis="both", labelsize=TICK_FT)
+        ax.grid(True, linestyle="--", alpha=0.30, linewidth=0.55)
+        ax.set_axisbelow(True)
+
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.8)
+            spine.set_color("0.35")
+
+        legend_handles = [
+            Line2D([0], [0], color=algo_color(algo), lw=2.2, label=algo)
+            for algo in algos
+        ]
+        fig.legend(
+            handles=legend_handles,
+            labels=algos,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.995),
+            ncol=len(algos),
+            frameon=False,
+            fontsize=LEGEND_FT,
+            columnspacing=1.25,
+            handlelength=2.2,
+        )
+
+        fig.tight_layout(rect=[0.03, 0.04, 0.98, 0.90])
+        fig.savefig(pdf_path, format="pdf", bbox_inches="tight", pad_inches=0.02)
+        fig.savefig(png_path, dpi=600, bbox_inches="tight", pad_inches=0.02)
+        plt.close(fig)
+
+    print(f"Saved energy-inflow envelope PDF: {pdf_path.resolve()}")
+    print(f"Saved energy-inflow envelope PNG: {png_path.resolve()}")
 
 
 def add_panel_textbox(ax, text: str | None, loc: str = "lower left", fontsize: int = 9) -> None:
@@ -884,13 +1476,42 @@ def draw_grouped_box_panel(
 
     ax.set_xlim(0.45, 12.55)
     ax.set_xticks(base_pos)
-    ax.set_xticklabels(months_abbr, fontsize=TICK_FT)
     ax.tick_params(axis="y", labelsize=TICK_FT)
-    ax.tick_params(axis="x", labelsize=TICK_FT)
 
-    ax.set_xlabel("Month" if show_xlabel else "", fontsize=LABEL_FT)
+    if show_xlabel:
+        ax.set_xticklabels(months_abbr, fontsize=TICK_FT)
+        ax.tick_params(axis="x", labelsize=TICK_FT, bottom=True, labelbottom=True)
+        ax.set_xlabel("Month", fontsize=LABEL_FT)
+    else:
+        ax.set_xticklabels([])
+        ax.tick_params(axis="x", bottom=False, labelbottom=False)
+        ax.set_xlabel("")
+
     ax.set_ylabel(ylabel, fontsize=LABEL_FT)
-    ax.set_title(title, fontsize=LABEL_FT, pad=6)
+
+    if title:
+        ax.set_title(title, fontsize=LABEL_FT, pad=6)
+
+    ax.grid(axis="y", alpha=0.22, linestyle="--", linewidth=0.5)
+
+    ax.set_xlim(0.45, 12.55)
+    ax.set_xticks(base_pos)
+    ax.tick_params(axis="y", labelsize=TICK_FT)
+
+    if show_xlabel:
+        ax.set_xticklabels(months_abbr, fontsize=TICK_FT)
+        ax.tick_params(axis="x", labelsize=TICK_FT, bottom=True, labelbottom=True)
+        ax.set_xlabel("Month", fontsize=LABEL_FT)
+    else:
+        ax.set_xticklabels([])
+        ax.tick_params(axis="x", bottom=False, labelbottom=False)
+        ax.set_xlabel("")
+
+    ax.set_ylabel(ylabel, fontsize=LABEL_FT)
+
+    if title:
+        ax.set_title(title, fontsize=LABEL_FT, pad=6)
+
     ax.grid(axis="y", alpha=0.22, linestyle="--", linewidth=0.5)
 
     for spine in ax.spines.values():
@@ -909,7 +1530,7 @@ def draw_grouped_box_panel(
 
 def plot_monthly_boxplots_suite(all_df: pd.DataFrame, output_dir: Path, reservoir: SharedReservoirModel) -> None:
     """
-    Save the 2×2 monthly comparison figure as PDF and PNG.
+    Save the monthly comparison figure as vertically stacked boxplots.
     """
     pdf_path = output_dir / "scenario_monthly_comparison_boxplots.pdf"
     png_path = output_dir / "scenario_monthly_comparison_boxplots.png"
@@ -918,20 +1539,28 @@ def plot_monthly_boxplots_suite(all_df: pd.DataFrame, output_dir: Path, reservoi
     if not algos:
         raise ValueError("No algorithm data available for plotting.")
 
-    with plt.rc_context({"font.sans-serif": ["DejaVu Sans", "Arial"], "axes.unicode_minus": False}):
-        fig, axes = plt.subplots(2, 2, figsize=(13.6, 9.2), dpi=600)
-        axes = axes.flatten()
+    plot_df = all_df.copy()
+    plot_df["power_gw"] = pd.to_numeric(plot_df["power"], errors="coerce") / 1e6  #  kW -> GW
+
+    with plt.rc_context(FONT_RC):
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(11.5, 10.2),
+            dpi=600,
+            sharex=True,
+        )
 
         power_hlines = [
-            (reservoir.max_power, "Installed capacity", "#d62728", "--"),
-            (reservoir.firm_power, "Firm power", "#2ca02c", "--"),
+            (reservoir.max_power / 1e6, "Installed capacity", "#d62728", "--"),
+            (reservoir.firm_power / 1e6, "Firm-power requirement", "#2ca02c", "--"),
         ]
         draw_grouped_box_panel(
             ax=axes[0],
-            df=all_df,
-            value_col="power",
-            ylabel="Power (kW)",
-            title="Power output",
+            df=plot_df,
+            value_col="power_gw",
+            ylabel="Power (GW)",
+            title="",
             panel_label="(a)",
             panel_facecolor=PANEL_FACE_COLORS[0],
             stat_text=None,
@@ -944,14 +1573,14 @@ def plot_monthly_boxplots_suite(all_df: pd.DataFrame, output_dir: Path, reservoi
 
         level_hlines = [
             (reservoir.normal_level, "Normal water level", "#d62728", "--"),
-            (reservoir.dead_level, "Dead water level", "#ff7f0e", "--"),
+            (reservoir.dead_level, "Dead water level", "#2ca02c", "--"),
         ]
         draw_grouped_box_panel(
             ax=axes[1],
             df=all_df,
             value_col="level",
             ylabel="Water level (m)",
-            title="Water level",
+            title="",
             panel_label="(b)",
             panel_facecolor=PANEL_FACE_COLORS[1],
             stat_text=None,
@@ -965,24 +1594,10 @@ def plot_monthly_boxplots_suite(all_df: pd.DataFrame, output_dir: Path, reservoi
         draw_grouped_box_panel(
             ax=axes[2],
             df=all_df,
-            value_col="energy",
-            ylabel="Electricity (GWh)",
-            title="Electricity generation",
-            panel_label="(c)",
-            panel_facecolor=PANEL_FACE_COLORS[2],
-            stat_text=None,
-            stats_loc="lower left",
-            hlines=None,
-            show_xlabel=True,
-        )
-
-        draw_grouped_box_panel(
-            ax=axes[3],
-            df=all_df,
             value_col="spill",
             ylabel=r"Spill discharge (m$^3$/s)",
-            title="Spill discharge",
-            panel_label="(d)",
+            title="",
+            panel_label="(c)",
             panel_facecolor=PANEL_FACE_COLORS[3],
             stat_text=None,
             stats_loc="lower left",
@@ -1001,19 +1616,16 @@ def plot_monthly_boxplots_suite(all_df: pd.DataFrame, output_dir: Path, reservoi
             bbox_to_anchor=(0.5, 0.995),
             ncol=len(algos),
             frameon=False,
-            title="Algorithm",
-            title_fontsize=LEGEND_FT,
             fontsize=LEGEND_FT,
         )
 
-        fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.93])
+        fig.tight_layout(rect=[0.03, 0.03, 0.98, 0.962])
         fig.savefig(pdf_path, format="pdf", bbox_inches="tight", pad_inches=0.02)
         fig.savefig(png_path, dpi=600, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
 
     print(f"Saved boxplot suite PDF: {pdf_path.resolve()}")
     print(f"Saved boxplot suite PNG: {png_path.resolve()}")
-
 
 def plot_representative_years_timeseries(
     all_df: pd.DataFrame,
@@ -1036,10 +1648,9 @@ def plot_representative_years_timeseries(
     month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     x = np.arange(1, 13)
 
-    inflow_long = reference_inflow_df.melt(id_vars="year", var_name="month_label", value_name="inflow")
-    inflow_long["month"] = np.tile(np.arange(1, 13), len(reference_inflow_df))
+    inflow_long = build_reference_inflow_long(reference_inflow_df)
 
-    with plt.rc_context({"font.sans-serif": ["DejaVu Sans", "Arial"], "axes.unicode_minus": False}):
+    with plt.rc_context(FONT_RC):
         fig, axes = plt.subplots(2, 1, figsize=(12.5, 8.0), dpi=600, sharex=True)
         if not isinstance(axes, np.ndarray):
             axes = np.array([axes])
@@ -1050,7 +1661,12 @@ def plot_representative_years_timeseries(
             if sub.empty:
                 continue
 
-            inflow_ref = inflow_long[inflow_long["year"] == year].sort_values("month")
+            inflow_ref = (
+                inflow_long[inflow_long["year"] == year]
+                .groupby("month", as_index=False)["inflow"]
+                .mean()
+                .sort_values("month")
+            )
 
             ax2 = ax.twinx()
             ax2.bar(
@@ -1086,7 +1702,7 @@ def plot_representative_years_timeseries(
 
             panel = "(a)" if i == 0 else "(b)"
             year_type = "Representative dry year" if tag == "dry" else "Representative wet year"
-            ax.set_title(f"{panel} {year_type} (Year {year})", fontsize=LABEL_FT, loc="left", pad=6)
+            ax.set_title(f"{panel} {year_type}", fontsize=LABEL_FT, loc="left", pad=6)
 
             ax.set_ylabel("Water level (m)", fontsize=LABEL_FT)
             ax2.set_ylabel(r"Inflow (m$^3$/s)", fontsize=LABEL_FT)
@@ -1123,7 +1739,7 @@ def plot_representative_years_timeseries(
             fontsize=LEGEND_FT,
         )
 
-        fig.tight_layout(rect=[0.02, 0.03, 0.98, 0.93])
+        fig.tight_layout(rect=[0.02, 0.03, 0.98, 0.958])
         fig.savefig(pdf_path, format="pdf", bbox_inches="tight", pad_inches=0.02)
         fig.savefig(png_path, dpi=600, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
@@ -1168,7 +1784,8 @@ def main() -> None:
         tex_path=visualization_dir / "scenario_monthly_summary_table.tex",
         algos=algos,
     )
-    plot_energy_inflow_level(all_df, visualization_dir)
+    plot_energy_inflow_level(all_df, visualization_dir, reservoir)
+    plot_energy_inflow_envelope_comparison(all_df, visualization_dir)
     plot_representative_years_timeseries(all_df, reference_inflow_df, visualization_dir, reservoir)
     plot_monthly_boxplots_suite(all_df, visualization_dir, reservoir)
 

@@ -24,6 +24,22 @@ import pandas as pd
 from reservoir_benchmark.shared.project_paths import get_data_dir, get_outputs_dir
 from reservoir_benchmark.shared.reservoir_model import SharedReservoirModel
 
+import matplotlib as mpl
+
+FONT_RC = {
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "font.sans-serif": ["Times New Roman"],
+    "mathtext.fontset": "custom",
+    "mathtext.rm": "Times New Roman",
+    "mathtext.it": "Times New Roman:italic",
+    "mathtext.bf": "Times New Roman:bold",
+    "axes.unicode_minus": False,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+}
+mpl.rcParams.update(FONT_RC)
+
 # Keep directory names unchanged, but use publication-friendly labels.
 ALGO_ORDER = ["DDP", "SDP", "ISO-SURF", "DQN"]
 ALGO_DIR_TO_LABEL = {
@@ -175,21 +191,21 @@ def get_all_reliability_values(dfs: Dict[str, pd.DataFrame]) -> np.ndarray:
 
 def get_reliability_axis_range(dfs: Dict[str, pd.DataFrame]) -> Tuple[float, float]:
     """
-    Return the full reliability range from all valid evaluation points.
+    Return a padded reliability range from all valid evaluation points.
     """
     values = get_all_reliability_values(dfs)
     if len(values) == 0:
         raise ValueError("No finite reliability values available for x-axis range.")
 
-    x_min = float(np.nanmin(values))
-    x_max = float(np.nanmax(values))
+    raw_x_min = float(np.nanmin(values))
+    raw_x_max = float(np.nanmax(values))
 
-    if np.isclose(x_min, x_max):
-        x_min = max(0.0, x_min - 0.5)
-        x_max = min(100.0, x_max + 0.5)
+    x_min = max(0.0, raw_x_min - 3)
+    x_max = min(100.0, raw_x_max + 3)
 
     print("=" * 60)
     print("Reliability-axis range")
+    print(f"  Raw reliability range: [{raw_x_min:.2f}, {raw_x_max:.2f}]")
     print(f"  Plot x-axis: [{x_min:.2f}, {x_max:.2f}]")
     print("=" * 60)
 
@@ -208,16 +224,20 @@ def main() -> None:
     curves = {algo: prep_curve(dfs[algo]) for algo in ALGO_ORDER}
 
     x_min, x_max = get_reliability_axis_range(dfs)
+    x_min = 80
+    x_max = 93
+
     x_grid = np.linspace(x_min, x_max, 200)
 
     pdf_path = visualization_dir / "overall_generation_reliability.pdf"
     png_path = visualization_dir / "overall_generation_reliability.png"
 
-    fig = plt.figure(figsize=(8, 4), dpi=600)
+    fig = plt.figure(figsize=(8.8, 4), dpi=600)
     ax = plt.gca()
 
     for algo in ALGO_ORDER:
-        x, y = curves[algo]
+        x, y_gwh = curves[algo]
+        y = y_gwh / 1000.0  # GWh/yr -> TWh/yr
         color = COLORS[algo]
 
         if len(x) == 0:
@@ -230,22 +250,23 @@ def main() -> None:
         ax.plot(x_grid, y_grid, color=color, linewidth=1.8, label=algo)
 
     ax.set_xlim(x_min, x_max)
-    ax.set_xlabel("Reliability (%)", fontsize=LABEL_FT)
-    ax.set_ylabel("Electricity Generation (GWh/yr)", fontsize=LABEL_FT)
+    ax.set_xlabel("Firm-power reliability (%)", fontsize=LABEL_FT)
+    ax.set_ylabel("Electricity generation (TWh/yr)", fontsize=LABEL_FT)
     ax.tick_params(axis="both", labelsize=TICK_FT)
     ax.grid(True, alpha=0.25)
 
-    legend = ax.legend(
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles=handles,
+        labels=labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
+        ncol=len(handles),
+        frameon=False,
         fontsize=LEGEND_FT,
-        ncol=1,
-        frameon=True,
-        loc="upper right",
-        bbox_to_anchor=(0.98, 0.98),
-        borderaxespad=0.0,
     )
-    legend.get_frame().set_alpha(0.85)
 
-    plt.tight_layout()
+    fig.tight_layout(rect=[0.03, 0.03, 0.98, 0.925])
     plt.savefig(pdf_path, dpi=600, bbox_inches="tight", format="pdf")
     plt.savefig(png_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
