@@ -88,6 +88,9 @@ PANEL_FACE_COLORS = [
 RELIABILITY_DRY_QUANTILE = 0.2
 RELIABILITY_WET_QUANTILE = 0.8
 
+# Common target used to select one representative solution per algorithm.
+TARGET_FIRM_POWER_RELIABILITY = 90.0
+
 # Candidate-pool diagnostics: (reliability floor %, historical minimum candidate ratio).
 RELIABILITY_FLOOR_RULES: List[Tuple[float, float]] = [
     (80.0, 0.30),
@@ -595,6 +598,54 @@ def _fallback_nearest_common_reliability(
     return selected
 
 
+
+def select_eval_files_nearest_target(
+    outputs_dir: Path,
+    firm_power: float,
+    target_reliability: float = TARGET_FIRM_POWER_RELIABILITY,
+) -> Dict[str, Path]:
+    """
+    Select one evaluation CSV per algorithm using a common reliability target.
+
+    For each algorithm, the selected file is the candidate whose firm-power
+    reliability has the minimum absolute deviation from ``target_reliability``.
+    This implements the representative-solution rule stated in the manuscript.
+    """
+    selected: Dict[str, Path] = {}
+
+    print(
+        f"Selecting representative solutions nearest to the common "
+        f"firm-power reliability target of {target_reliability:.2f}%:"
+    )
+
+    for algo_label in ALGO_ORDER:
+        eval_dir = outputs_dir / "evaluation" / ALGO_DIR_MAP[algo_label]
+        candidates = collect_eval_candidates(
+            algo_label=algo_label,
+            eval_dir=eval_dir,
+            firm_power=firm_power,
+        )
+
+        nearest = min(
+            candidates,
+            key=lambda item: (
+                abs(item[2] - target_reliability),
+                item[1],
+                item[0].name.lower(),
+            ),
+        )
+        csv_path, lambda_value, reliability_pct = nearest
+        deviation_pp = reliability_pct - target_reliability
+        selected[algo_label] = csv_path
+
+        print(
+            f"  {algo_label}: {csv_path.name} | lambda = {lambda_value:.6g} | "
+            f"reliability = {reliability_pct:.2f}% | "
+            f"signed deviation = {deviation_pp:+.2f} percentage points"
+        )
+
+    return selected
+
 def select_best_eval_file_combination(
     outputs_dir: Path,
     firm_power: float,
@@ -802,6 +853,262 @@ def compute_long_term_means(df: pd.DataFrame, value_col: str, algos: Iterable[st
             stats[algo] = float(mean_monthly)
     return stats
 
+
+
+def _longest_circular_month_run(months: Iterable[int]) -> List[int]:
+    """
+    Return the longest consecutive run of calendar months, allowing Dec--Jan wrap.
+    """
+    unique = sorted({int(m) for m in months if 1 <= int(m) <= 12})
+    if not unique:
+        return []
+    if len(unique) == 12:
+        return list(range(1, 13))
+
+    present = set(unique)
+    best: List[int] = []
+
+    for start in unique:
+        run: List[int] = []
+        month = start
+        for _ in range(12):
+            if month not in present:
+                break
+            run.append(month)
+            month = 1 if month == 12 else month + 1
+        if len(run) > len(best):
+            best = run
+
+    return best
+
+
+def _format_month_sequence(months: List[int]) -> str:
+    """Format one month or a consecutive month span for manuscript text."""
+    if not months:
+        return ""
+    labels = [MONTH_COLUMNS[m - 1] for m in months]
+    if len(labels) == 1:
+        return labels[0]
+    return f"{labels[0]}--{labels[-1]}"
+
+
+def export_dqn_monthly_level_head_diagnostics(
+    all_df: pd.DataFrame,
+    output_dir: Path,
+    reservoir: SharedReservoirModel,
+    comparison_algos: Tuple[str, ...] = ("SDP", "ISO-SURF"),
+    focus_months: Iterable[int] | None = None,
+) -> Dict[str, object]:
+    """
+    Quantify monthly DQN water-level and head differences for manuscript reporting.
+
+    Monthly means are first computed over the complete evaluation sequence. Positive
+    level-gap values mean that DQN operates at a lower reservoir level than the named
+    comparison algorithm. When ``focus_months`` is omitted, the function identifies
+    the longest consecutive calendar-month period in which DQN is lower than every
+    comparison algorithm.
+
+    Outputs
+    -------
+    scenario_monthly_dqn_level_head_diagnostics.csv
+        Month-by-month mean values and DQN deficits.
+    scenario_monthly_dqn_level_head_summary.csv
+        Compact X/Y/Z and month statistics.
+    scenario_monthly_dqn_level_head_sentence.txt
+        Ready-to-edit manuscript wording.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    required_algos = {"DQN", *comparison_algos}
+    available_algos = set(pd.unique(all_df["algo"]))
+    missing_algos = sorted(required_algos.difference(available_algos))
+    if missing_algos:
+        raise ValueError(
+            "Monthly DQN diagnostics require these algorithms, but they are missing: "
+            f"{missing_algos}"
+        )
+
+    df = all_df.copy()
+    power = pd.to_numeric(df["power"], errors="coerce").to_numpy(dtype=float)
+    turbine = pd.to_numeric(df["turbine"], errors="coerce").to_numpy(dtype=float)
+    denominator = reservoir.power_coefficient * turbine
+    df["head"] = np.where(
+        (denominator > 1e-9) & np.isfinite(power),
+        power / denominator,
+        np.nan,
+    )
+
+    monthly = (
+        df.groupby(["month", "algo"], as_index=False)
+        .agg(
+            mean_level_m=("level", "mean"),
+            mean_head_m=("head", "mean"),
+            mean_power_kw=("power", "mean"),
+            mean_energy_gwh=("energy", "mean"),
+        )
+        .sort_values(["month", "algo"])
+        .reset_index(drop=True)
+    )
+
+    level_pivot = monthly.pivot(index="month", columns="algo", values="mean_level_m")
+    head_pivot = monthly.pivot(index="month", columns="algo", values="mean_head_m")
+    power_pivot = monthly.pivot(index="month", columns="algo", values="mean_power_kw")
+    energy_pivot = monthly.pivot(index="month", columns="algo", values="mean_energy_gwh")
+
+    detail = pd.DataFrame({"month": np.arange(1, 13, dtype=int)})
+    detail["month_label"] = detail["month"].map(lambda m: MONTH_COLUMNS[m - 1])
+
+    for algo in ["DDP", "SDP", "ISO-SURF", "DQN"]:
+        if algo in level_pivot.columns:
+            detail[f"{algo}_mean_level_m"] = detail["month"].map(level_pivot[algo])
+        if algo in head_pivot.columns:
+            detail[f"{algo}_mean_head_m"] = detail["month"].map(head_pivot[algo])
+        if algo in power_pivot.columns:
+            detail[f"{algo}_mean_power_GW"] = detail["month"].map(power_pivot[algo]) / 1e6
+        if algo in energy_pivot.columns:
+            detail[f"{algo}_mean_energy_GWh"] = detail["month"].map(energy_pivot[algo])
+
+    level_gap_cols: List[str] = []
+    head_gap_cols: List[str] = []
+    for algo in comparison_algos:
+        level_col = f"level_gap_{algo}_minus_DQN_m"
+        head_col = f"head_gap_{algo}_minus_DQN_m"
+        detail[level_col] = detail[f"{algo}_mean_level_m"] - detail["DQN_mean_level_m"]
+        detail[head_col] = detail[f"{algo}_mean_head_m"] - detail["DQN_mean_head_m"]
+        level_gap_cols.append(level_col)
+        head_gap_cols.append(head_col)
+
+    if focus_months is None:
+        lower_than_all = detail[level_gap_cols].gt(0).all(axis=1)
+        auto_months = detail.loc[lower_than_all, "month"].astype(int).tolist()
+        selected_months = _longest_circular_month_run(auto_months)
+        if not selected_months:
+            # Fallback: use all months where the average gap is positive.
+            positive_mean_gap = detail[level_gap_cols].mean(axis=1) > 0
+            selected_months = detail.loc[positive_mean_gap, "month"].astype(int).tolist()
+    else:
+        selected_months = sorted({int(m) for m in focus_months if 1 <= int(m) <= 12})
+
+    if not selected_months:
+        raise ValueError(
+            "No month was identified in which DQN had a lower mean level than "
+            "the comparison algorithms. Specify focus_months explicitly if needed."
+        )
+
+    period = detail[detail["month"].isin(selected_months)].copy()
+    month_span = _format_month_sequence(selected_months)
+
+    stacked_level_gaps = (
+        period.set_index(["month", "month_label"])[level_gap_cols]
+        .stack()
+        .rename("gap_m")
+        .reset_index()
+        .rename(columns={"level_2": "comparison"})
+    )
+    stacked_level_gaps = stacked_level_gaps[stacked_level_gaps["gap_m"] > 0].copy()
+    if stacked_level_gaps.empty:
+        raise ValueError("No positive DQN water-level deficit was found in the selected period.")
+
+    x_min = float(stacked_level_gaps["gap_m"].min())
+    y_max = float(stacked_level_gaps["gap_m"].max())
+    max_row = stacked_level_gaps.loc[stacked_level_gaps["gap_m"].idxmax()]
+    z_max = float(max_row["gap_m"])
+    z_month = str(max_row["month_label"])
+    z_comparison = str(max_row["comparison"]).replace("level_gap_", "").replace("_minus_DQN_m", "")
+
+    comparator_mean_gaps = {
+        algo: float(period[f"level_gap_{algo}_minus_DQN_m"].mean())
+        for algo in comparison_algos
+    }
+
+    stacked_head_gaps = (
+        period.set_index(["month", "month_label"])[head_gap_cols]
+        .stack()
+        .rename("gap_m")
+        .reset_index()
+        .rename(columns={"level_2": "comparison"})
+    )
+    stacked_head_gaps = stacked_head_gaps[np.isfinite(stacked_head_gaps["gap_m"])].copy()
+    if not stacked_head_gaps.empty:
+        max_head_row = stacked_head_gaps.loc[stacked_head_gaps["gap_m"].idxmax()]
+        max_head_gap = float(max_head_row["gap_m"])
+        max_head_month = str(max_head_row["month_label"])
+        max_head_comparison = str(max_head_row["comparison"]).replace("head_gap_", "").replace("_minus_DQN_m", "")
+    else:
+        max_head_gap = float("nan")
+        max_head_month = ""
+        max_head_comparison = ""
+
+    summary = {
+        "focus_months": selected_months,
+        "month_span": month_span,
+        "level_gap_min_m": x_min,
+        "level_gap_max_m": y_max,
+        "largest_level_gap_m": z_max,
+        "largest_level_gap_month": z_month,
+        "largest_level_gap_comparison": z_comparison,
+        "mean_level_gap_vs_SDP_m": comparator_mean_gaps.get("SDP", np.nan),
+        "mean_level_gap_vs_ISO_SURF_m": comparator_mean_gaps.get("ISO-SURF", np.nan),
+        "largest_head_gap_m": max_head_gap,
+        "largest_head_gap_month": max_head_month,
+        "largest_head_gap_comparison": max_head_comparison,
+    }
+
+    detail_path = output_dir / "scenario_monthly_dqn_level_head_diagnostics.csv"
+    summary_path = output_dir / "scenario_monthly_dqn_level_head_summary.csv"
+    sentence_path = output_dir / "scenario_monthly_dqn_level_head_sentence.txt"
+
+    detail.to_csv(detail_path, index=False, encoding="utf-8-sig", float_format="%.4f")
+    pd.DataFrame([summary]).to_csv(summary_path, index=False, encoding="utf-8-sig")
+
+    range_sentence = (
+        f"Across the complete evaluation sequence, the monthly mean DQN reservoir "
+        f"level was {x_min:.1f}--{y_max:.1f} m lower than those of SDP and ISO-SURF "
+        f"during {month_span}, with the largest gap of {z_max:.1f} m relative to "
+        f"{z_comparison} occurring in {z_month}."
+    )
+    specific_sentence = (
+        f"During {month_span}, the monthly mean DQN reservoir level was on average "
+        f"{comparator_mean_gaps.get('SDP', np.nan):.1f} m lower than SDP and "
+        f"{comparator_mean_gaps.get('ISO-SURF', np.nan):.1f} m lower than ISO-SURF; "
+        f"the largest monthly gap was {z_max:.1f} m relative to {z_comparison} in {z_month}."
+    )
+
+    text_lines = [
+        "Recommended comparator-specific sentence:",
+        specific_sentence,
+        "",
+        "Alternative range sentence:",
+        range_sentence,
+    ]
+    if np.isfinite(max_head_gap):
+        text_lines.extend(
+            [
+                "",
+                "Optional head-support sentence:",
+                f"The largest monthly mean-head gap was {max_head_gap:.1f} m relative "
+                f"to {max_head_comparison} in {max_head_month}.",
+            ]
+        )
+
+    sentence_path.write_text("\n".join(text_lines), encoding="utf-8")
+
+    print("\nMonthly DQN water-level/head diagnostics:")
+    print(f"  automatically selected month span: {month_span}")
+    print(f"  combined level-gap range X--Y: {x_min:.2f}--{y_max:.2f} m")
+    print(f"  largest level gap Z: {z_max:.2f} m vs {z_comparison} in {z_month}")
+    for algo, value in comparator_mean_gaps.items():
+        print(f"  mean level gap vs {algo}: {value:.2f} m")
+    if np.isfinite(max_head_gap):
+        print(
+            f"  largest mean-head gap: {max_head_gap:.2f} m "
+            f"vs {max_head_comparison} in {max_head_month}"
+        )
+    print(f"  saved monthly details: {detail_path.resolve()}")
+    print(f"  saved summary: {summary_path.resolve()}")
+    print(f"  saved manuscript sentence: {sentence_path.resolve()}")
+
+    return summary
 
 def build_summary_table_df(all_df: pd.DataFrame, firm_power: float, algos: Iterable[str]) -> pd.DataFrame:
     """
@@ -1278,25 +1585,49 @@ def plot_energy_inflow_envelope_comparison(all_df: pd.DataFrame, output_dir: Pat
     if not algos:
         raise ValueError("No algorithm data available for envelope plotting.")
 
-    x_values = pd.to_numeric(annual_df["inflow_mean"], errors="coerce").to_numpy(dtype=float)
     y_values = pd.to_numeric(annual_df["energy_twh"], errors="coerce").to_numpy(dtype=float)
-    finite_x = x_values[np.isfinite(x_values)]
     finite_y = y_values[np.isfinite(y_values)]
 
-    if len(finite_x) == 0 or len(finite_y) == 0:
-        raise ValueError("No finite annual inflow or energy values are available for envelope plotting.")
+    if len(finite_y) == 0:
+        raise ValueError("No finite annual energy values are available for envelope plotting.")
 
+    # Build the plotted envelopes first. The x-axis limits are then based on the
+    # actual envelope curves rather than on raw annual inflow extremes, because
+    # the latter can leave large empty margins beyond the smoothed curves.
+    envelope_map: Dict[str, pd.DataFrame] = {}
+    plotted_x_values: List[np.ndarray] = []
+
+    for algo in algos:
+        envelope = _build_energy_inflow_envelope(annual_df, algo=algo)
+        if envelope.empty or len(envelope) < 2:
+            continue
+        envelope_map[algo] = envelope
+        x_env = pd.to_numeric(envelope["inflow_mean"], errors="coerce").to_numpy(dtype=float)
+        x_env = x_env[np.isfinite(x_env)]
+        if len(x_env):
+            plotted_x_values.append(x_env)
+
+    if not plotted_x_values:
+        raise ValueError("No valid envelope data are available for plotting.")
+
+    finite_x = np.concatenate(plotted_x_values)
     x_min, x_max = float(np.nanmin(finite_x)), float(np.nanmax(finite_x))
     y_min, y_max = float(np.nanmin(finite_y)), float(np.nanmax(finite_y))
-    x_pad = (x_max - x_min) * 0.045 if not np.isclose(x_min, x_max) else max(abs(x_min) * 0.045, 1.0)
+
+    # Keep only a narrow 1.2% horizontal margin so the curves fill the panel.
+    x_range = x_max - x_min
+    x_pad = x_range * 0.012 if not np.isclose(x_range, 0.0) else max(abs(x_min) * 0.012, 1.0)
+
     y_pad = (y_max - y_min) * 0.100 if not np.isclose(y_min, y_max) else max(abs(y_min) * 0.100, 0.1)
+    xlim = (x_min - x_pad, x_max + x_pad)
+    ylim = (y_min - y_pad, y_max + y_pad)
 
     with plt.rc_context(FONT_RC):
         fig, ax = plt.subplots(figsize=(13.2, 4.4), dpi=600)
 
         for algo in algos:
-            envelope = _build_energy_inflow_envelope(annual_df, algo=algo)
-            if envelope.empty or len(envelope) < 2:
+            envelope = envelope_map.get(algo)
+            if envelope is None:
                 continue
 
             x_env = envelope["inflow_mean"].to_numpy(dtype=float)
@@ -1337,6 +1668,7 @@ def plot_energy_inflow_envelope_comparison(all_df: pd.DataFrame, output_dir: Pat
             ax.plot(x_grid, y_mid, color=color, linewidth=2.2, alpha=0.96, label=algo, zorder=3)
 
         ax.set_xlim(*xlim)
+        ax.margins(x=0)
         ax.set_ylim(*ylim)
         ax.set_xlabel("Mean Annual Inflow (m³/s)", fontsize=LABEL_FT)
         ax.set_ylabel("Annual Electricity Generation (TWh/yr)", fontsize=LABEL_FT)
@@ -1756,10 +2088,10 @@ def main() -> None:
 
     reservoir = SharedReservoirModel(data_dir=get_data_dir())
 
-    selected_files = select_best_eval_file_combination(
+    selected_files = select_eval_files_nearest_target(
         outputs_dir=outputs_dir,
         firm_power=reservoir.firm_power,
-        floor_rules=RELIABILITY_FLOOR_RULES,
+        target_reliability=TARGET_FIRM_POWER_RELIABILITY,
     )
 
     frames: List[pd.DataFrame] = []
@@ -1777,6 +2109,14 @@ def main() -> None:
     algos = get_algos_present(all_df)
 
     reference_inflow_df = load_reference_inflow_table()
+
+    export_dqn_monthly_level_head_diagnostics(
+        all_df=all_df,
+        output_dir=visualization_dir,
+        reservoir=reservoir,
+        comparison_algos=("SDP", "ISO-SURF"),
+        focus_months=None,  # Auto-detect the longest period where DQN is lower than both.
+    )
 
     export_summary_table_to_latex(
         all_df=all_df,

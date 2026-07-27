@@ -224,8 +224,8 @@ def main() -> None:
     curves = {algo: prep_curve(dfs[algo]) for algo in ALGO_ORDER}
 
     x_min, x_max = get_reliability_axis_range(dfs)
-    x_min = 80
-    x_max = 93
+    # x_min = 80
+    # x_max = 93
 
     x_grid = np.linspace(x_min, x_max, 200)
 

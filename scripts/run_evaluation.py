@@ -19,20 +19,20 @@ from reservoir_benchmark.evaluation.dqn.dqn_eval import main_dqn_eval
 
 def main() -> None:
     try:
-        print("=" * 80)
-        print("Running DDP evaluation...")
-        print("=" * 80)
-        main_ddp_eval()
-
-        print("\n" + "=" * 80)
-        print("Running SDP evaluation...")
-        print("=" * 80)
-        main_sdp_eval()
-
-        print("\n" + "=" * 80)
-        print("Running ISO-SURF evaluation...")
-        print("=" * 80)
-        main_iso_surf_eval()
+        # print("=" * 80)
+        # print("Running DDP evaluation...")
+        # print("=" * 80)
+        # main_ddp_eval()
+        #
+        # print("\n" + "=" * 80)
+        # print("Running SDP evaluation...")
+        # print("=" * 80)
+        # main_sdp_eval()
+        #
+        # print("\n" + "=" * 80)
+        # print("Running ISO-SURF evaluation...")
+        # print("=" * 80)
+        # main_iso_surf_eval()
 
         print("\n" + "=" * 80)
         print("Running DQN evaluation...")
