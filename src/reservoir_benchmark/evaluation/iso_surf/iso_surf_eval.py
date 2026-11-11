@@ -21,6 +21,11 @@ import numpy as np
 import pandas as pd
 
 from reservoir_benchmark.policy_generation.iso_surf.iso_surf_runner import ISOSurfPolicyFitter
+from reservoir_benchmark.shared.inflow_forecast import (
+    ForecastScenario,
+    forecast_evaluation_dir,
+    load_forecast_penalty_candidates,
+)
 from reservoir_benchmark.shared.io_utils import (
     load_monthly_inflows_from_excel,
     load_penalty_candidates,
@@ -39,15 +44,26 @@ class ISOReservoirSimulator:
     Closed-loop simulator using fitted ISO-SURF policy surfaces.
     """
 
-    def __init__(self):
+    def __init__(
+        self, forecast: ForecastScenario | None = None, policy_forecast: ForecastScenario | None = None
+    ):
         self.data_dir = get_data_dir()
+        self.forecast = forecast
         self.policy_dir = get_policy_generation_dir("iso_surf") / "policy"
-        self.output_dir = get_outputs_dir() / "evaluation" / "iso_surf"
+        policy_forecast = policy_forecast or forecast
+        if policy_forecast is not None:
+            self.policy_dir /= policy_forecast.name
+        self.output_dir = forecast_evaluation_dir(
+            get_outputs_dir() / "evaluation" / "iso_surf", forecast, policy_forecast
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.evaluation_inflow_file = self.data_dir / "SynMonthlyInflow_evaluation.xlsx"
         self.penalty_settings_file = self.data_dir / "penalty_settings.yaml"
-        self.penalty_lambdas = load_penalty_candidates(self.penalty_settings_file, "iso_surf")
+        if forecast is None:
+            self.penalty_lambdas = load_penalty_candidates(self.penalty_settings_file, "iso_surf")
+        else:
+            self.penalty_lambdas = load_forecast_penalty_candidates("iso_surf")
 
         self.reservoir = SharedReservoirModel(data_dir=self.data_dir)
 
@@ -60,7 +76,9 @@ class ISOReservoirSimulator:
         self.power_coefficient = self.reservoir.power_coefficient
         self.delta_t_days = self.reservoir.delta_t_days
 
-    def simulate_one_year(self, year_inflows, initial_level: float, policy: ISOSurfPolicyFitter):
+    def simulate_one_year(
+        self, year_inflows, initial_level: float, policy: ISOSurfPolicyFitter, year_forecasts=None
+    ):
         """
         Simulate one year of operation using the fitted ISO-SURF policy.
         """
@@ -73,11 +91,12 @@ class ISOReservoirSimulator:
 
         current_level = initial_level
 
-        for month in range(12):
-            inflow = float(year_inflows[month])
+        for month, month_inflow in enumerate(year_inflows):
+            inflow = float(month_inflow)
             month_of_year = month + 1
+            next_inflow_forecast = None if year_forecasts is None else float(year_forecasts[month])
 
-            target_level = policy.predict_next_level(month_of_year, current_level, inflow)
+            target_level = policy.predict_next_level(month_of_year, current_level, inflow, next_inflow_forecast)
             target_level = max(self.dead_level, min(self.normal_level, target_level))
 
             current_storage = self.reservoir.calculate_storage(current_level)
@@ -163,6 +182,9 @@ class ISOReservoirSimulator:
         inflows_data = load_monthly_inflows_from_excel(self.evaluation_inflow_file)
         inflows = inflows_data.values
         years = len(inflows)
+        forecasts = None
+        if self.forecast is not None:
+            forecasts = self.forecast.next_month(inflows, self.forecast.evaluation_seed)
 
         all_monthly_levels = [self.initial_level]
         all_monthly_energy = []
@@ -175,6 +197,9 @@ class ISOReservoirSimulator:
 
         for year in range(years):
             year_inflows = inflows[year]
+            if self.forecast is not None and year == years - 1:
+                year_inflows = year_inflows[:-1]
+            year_forecasts = None if forecasts is None else forecasts[year]
 
             if year == 0:
                 initial_level = self.initial_level
@@ -188,7 +213,7 @@ class ISOReservoirSimulator:
                 monthly_spill,
                 monthly_turbine_discharge,
                 monthly_total_discharge,
-            ) = self.simulate_one_year(year_inflows, initial_level, policy)
+            ) = self.simulate_one_year(year_inflows, initial_level, policy, year_forecasts)
 
             all_monthly_levels.extend(monthly_levels[1:])
             all_monthly_energy.extend(monthly_energy)
@@ -200,7 +225,7 @@ class ISOReservoirSimulator:
             annual_energy_list.append(float(np.sum(monthly_energy)))
 
         inflow_flat = inflows.reshape(-1)
-        n = years * 12
+        n = len(all_monthly_power)
 
         df_iso = pd.DataFrame(
             {
@@ -218,6 +243,8 @@ class ISOReservoirSimulator:
         power_series = np.asarray(all_monthly_power, dtype=float)
         reliability = float(np.mean(power_series >= self.firm_power)) if len(power_series) > 0 else None
         avg_annual_energy = float(np.mean(annual_energy_list)) if len(annual_energy_list) > 0 else 0.0
+        if self.forecast is not None and n > 0:
+            avg_annual_energy = float(np.sum(all_monthly_energy) * 12 / n)
 
         return df_iso, avg_annual_energy, reliability
 
@@ -274,8 +301,10 @@ class ISOReservoirSimulator:
                 )
 
 
-def main_iso_surf_eval() -> None:
-    simulator = ISOReservoirSimulator()
+def main_iso_surf_eval(
+    forecast: ForecastScenario | None = None, policy_forecast: ForecastScenario | None = None
+) -> None:
+    simulator = ISOReservoirSimulator(forecast=forecast, policy_forecast=policy_forecast)
     simulator.run_all()
 
 

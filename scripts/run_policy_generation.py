@@ -10,12 +10,26 @@ The purpose of this script is to keep executable policy-generation workflows
 separate from reusable library modules.
 """
 
+import argparse
+
 from reservoir_benchmark.policy_generation.sdp.sdp_runner import main_sdp
 from reservoir_benchmark.policy_generation.iso_surf.iso_surf_runner import main_iso_surf
 from reservoir_benchmark.policy_generation.dqn.dqn_runner import main_dqn
+from reservoir_benchmark.shared.inflow_forecast import load_forecast_scenarios
 
 
-def main() -> None:
+def main(forecast_sensitivity: bool = False) -> None:
+    if forecast_sensitivity:
+        scenarios = load_forecast_scenarios()
+        main_iso_surf(forecast=scenarios)
+        for forecast in scenarios:
+            print(f"\nGenerating SDP policies for {forecast.name}")
+            main_sdp(forecast=forecast)
+        for forecast in scenarios:
+            print(f"\nGenerating DQN policies for {forecast.name}")
+            main_dqn(forecast=forecast)
+        return
+
     try:
         # print("=" * 80)
         print("Running SDP policy generation...")
@@ -44,4 +58,6 @@ def main() -> None:
 #
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate reservoir operation policies.")
+    parser.add_argument("--forecast-sensitivity", action="store_true")
+    main(forecast_sensitivity=parser.parse_args().forecast_sensitivity)

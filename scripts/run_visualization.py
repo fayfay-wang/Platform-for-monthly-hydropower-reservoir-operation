@@ -9,11 +9,18 @@ The purpose of this script is to keep executable reporting workflows separate
 from reusable reporting modules.
 """
 
+import argparse
+
+from reservoir_benchmark.visualization.forecast_visualization import main as main_forecast_visualization
 from reservoir_benchmark.visualization.scenario_visualization import main as main_scenario_visualization
 from reservoir_benchmark.visualization.overall_visualization import main as main_overall_visualization
 
 
-def main() -> None:
+def main(forecast_sensitivity: bool = False) -> None:
+    if forecast_sensitivity:
+        main_forecast_visualization()
+        return
+
     try:
         print("=" * 80)
         print("Running scenario-level reporting...")
@@ -37,4 +44,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Visualize reservoir operation results.")
+    parser.add_argument("--forecast-sensitivity", action="store_true")
+    main(forecast_sensitivity=parser.parse_args().forecast_sensitivity)

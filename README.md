@@ -180,6 +180,24 @@ python scripts/run_visualization.py
 
 Figures and summary files are written to `outputs/visualization/`.
 
+### Forecast Sensitivity
+
+Run the forecast experiment with the same training and evaluation inflow files used by the benchmark.
+
+```bash
+python scripts/run_policy_generation.py --forecast-sensitivity
+python scripts/run_evaluation.py --forecast-sensitivity
+python scripts/run_visualization.py --forecast-sensitivity
+```
+
+All three methods observe calendar month, current reservoir level or storage, and current inflow. The perfect-forecast case also observes the realized inflow for the next month. The noisy cases multiply next-month inflow by a mean-one lognormal factor with a relative standard deviation of 10%, 25%, or 50%. The no-forecast case uses the current information only. Reservoir dynamics use the realized current inflow in every case.
+
+SDP solves its policy using each observation structure. ISO-SURF fits each rule against the same full-horizon DDP trajectory computed on the training inflow. Each training example aligns the start-of-month level and current inflow with the DDP end-of-month target. With a forecast, ISO-SURF fits the monthly surface within forecast bands and interpolates between surfaces. The no-forecast case fits a single surface per month. DQN is trained separately with each observation structure.
+
+Evaluation compares policies trained for the supplied forecast with perfect-forecast policies evaluated under the same noisy signals. Noise draws are paired across methods and error levels using the evaluation seeds. The last month is omitted because the evaluation record has no subsequent inflow. DQN reliability is computed separately for each trained model before averaging.
+
+The fixed penalty coefficients, error levels, and noise seeds are in `forecast_sensitivity` in `data/experiment_settings.yaml`. The scripts save scenario-specific policies and evaluation files under each algorithm's existing output directory. The sensitivity figure and summary and per-seed tables are written to `outputs/visualization/forecast_sensitivity/`.
+
 ## Workflow Overview
 
 ```text

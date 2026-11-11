@@ -39,6 +39,10 @@ from reservoir_benchmark.policy_generation.dqn.dqn_agent import (
     DQNAgent,
     set_global_seed,
 )
+from reservoir_benchmark.shared.inflow_forecast import (
+    ForecastScenario,
+    load_forecast_penalty_candidates,
+)
 from reservoir_benchmark.shared.io_utils import load_penalty_candidates
 from reservoir_benchmark.shared.project_paths import (
     format_lambda_for_filename,
@@ -55,13 +59,15 @@ if hasattr(torch, "set_float32_matmul_precision"):
 torch._dynamo.config.suppress_errors = True
 
 
-def run_training_sweep_lambdas():
+def run_training_sweep_lambdas(forecast: ForecastScenario | None = None):
     """
     Train one DQN model for each lambda defined in penalty_settings.yaml.
     """
-    data_dir = get_data_dir()
-    penalty_settings_path = data_dir / "penalty_settings.yaml"
-    lam_list = load_penalty_candidates(penalty_settings_path, "dqn")
+    if forecast is None:
+        penalty_settings_path = get_data_dir() / "penalty_settings.yaml"
+        lam_list = load_penalty_candidates(penalty_settings_path, "dqn")
+    else:
+        lam_list = load_forecast_penalty_candidates("dqn")
 
     base_config = Config()
 
@@ -70,13 +76,17 @@ def run_training_sweep_lambdas():
         print(f"[SWEEP] Start training with firm_penalty_lambda = {lam}")
         print("=" * 80)
         for seed in base_config.get_seed_list():
-            run_training(firm_penalty_lambda=float(lam), seed=int(seed))
+            run_training(firm_penalty_lambda=float(lam), seed=int(seed), forecast=forecast)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
 
-def run_training(firm_penalty_lambda: float, seed: int) -> None:
+def run_training(
+    firm_penalty_lambda: float,
+    seed: int,
+    forecast: ForecastScenario | None = None,
+) -> None:
     """
     Train one DQN model for a single lambda value.
     """
@@ -109,6 +119,8 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
     lam_str = format_lambda_for_filename(lam_val)
 
     model_output_dir = get_policy_generation_dir("dqn") / "policy"
+    if forecast is not None:
+        model_output_dir /= forecast.name
     model_output_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_output_dir / f"dqn_train_lambda_{lam_str}_seed_{seed}.pth"
 
@@ -118,7 +130,7 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
     # the DQN agent. The environment defines the state/action spaces, while
     # the agent contains the replay buffer, networks, and optimizer.
     basic_info = BasicInfo(config)
-    env = ReservoirEnv(basic_info, debug=True)
+    env = ReservoirEnv(basic_info, debug=True, forecast=forecast)
 
     agent = DQNAgent(
         n_actions=env.action_space.n,
@@ -152,7 +164,7 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
     if (AsyncVectorEnv is not None) and (num_envs > 1):
 
         def make_env():
-            return ReservoirEnv(basic_info, debug=False)
+            return ReservoirEnv(basic_info, debug=False, forecast=forecast)
 
         envs = AsyncVectorEnv([make_env for _ in range(num_envs)])
         seed = config.get_seed()
@@ -167,7 +179,10 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
 
             while True:
                 # Normalize observations before feeding them into the Q-network.
-                norm = (obs - agent.state_low) * agent._norm_scale
+                if forecast is None:
+                    norm = (obs - agent.state_low) * agent._norm_scale
+                else:
+                    norm = agent.normalize_state(obs)
                 obs_tensor = torch.as_tensor(norm, dtype=torch.float32, device=agent.device)
 
                 # Greedy actions from the current online network.
@@ -183,6 +198,7 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
 
                 next_obs, rewards, terminated, truncated, infos = envs.step(actions)
                 dones = np.logical_or(terminated, truncated)
+                terminal_transitions = dones if forecast is None else terminated
 
                 # Store one transition per environment into the replay buffer.
                 for i in range(num_envs):
@@ -191,7 +207,7 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
                         int(actions[i]),
                         float(rewards[i]),
                         next_obs[i],
-                        bool(dones[i]),
+                        bool(terminal_transitions[i]),
                     )
 
                 episode_reward_buffer += rewards
@@ -292,7 +308,13 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
 
                 # Store the transition and, if enough data are available,
                 # perform one learning step.
-                agent.store_transition(observation, action, reward, next_observation)
+                agent.store_transition(
+                    observation,
+                    action,
+                    reward,
+                    next_observation,
+                    done=forecast is not None and terminated,
+                )
 
                 if len(agent.memory) > agent.batch_size:
                     loss = agent.learn()
@@ -356,8 +378,8 @@ def run_training(firm_penalty_lambda: float, seed: int) -> None:
     print(f"Training completed. Best model path: {model_path}")
 
 
-def main_dqn() -> None:
-    run_training_sweep_lambdas()
+def main_dqn(forecast: ForecastScenario | None = None) -> None:
+    run_training_sweep_lambdas(forecast)
 
 
 if __name__ == "__main__":

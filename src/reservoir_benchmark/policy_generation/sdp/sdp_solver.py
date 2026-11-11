@@ -24,12 +24,12 @@ class ReservoirOperation:
     Stochastic dynamic programming (SDP) for single-reservoir operation.
     """
 
-    def __init__(self, reservoir, inflows, flow_probs, flow_intervals):
+    def __init__(self, reservoir, inflows, flow_probs=None, flow_intervals=None):
         self.reservoir = reservoir
         self.inflows = inflows
         self.flow_probs = flow_probs
         self.flow_intervals = flow_intervals
-        self.n_flows = len(flow_probs)
+        self.n_flows = inflows.shape[1]
 
         # Shared parameters from SharedReservoirModel
         self.dead_level = self.reservoir.dead_level
@@ -199,6 +199,53 @@ class ReservoirOperation:
     
         converged = max_diff <= self.config["threshold"]
         return converged, max_diff
+
+    def _stage_benefits(self) -> np.ndarray:
+        """Compute monthly rewards for all current-level, target-level and inflow combinations."""
+        storage_release = (self.volumes[:, None] - self.volumes[None, :]) * 1e9
+        storage_release /= self.reservoir.delta_t_seconds
+        discharge = np.asarray(self.inflows)[:, None, None, :] + storage_release[None, :, :, None]
+        average_level = (self.levels[:, None] + self.levels[None, :]) / 2.0
+        tailwater = np.polyval(self.reservoir.tailwater_curve_coefficients, discharge)
+        head = average_level[None, :, :, None] - tailwater
+        turbine_discharge = np.minimum(discharge, self.max_turbine_discharge)
+        power = np.minimum(self.power_coefficient * turbine_discharge * head, self.max_power)
+        lam = self.config["firm_power_penalty_lambda"]
+        if self.firm_power > 0.0 and lam > 0.0:
+            power -= lam * np.maximum(self.firm_power - power, 0.0)
+        energy = power * self.reservoir.delta_t_hours
+        return np.where(discharge >= 0.0, energy, -np.inf)
+
+    def optimize_with_forecast(
+        self,
+        transitions: np.ndarray,
+        forecast_probs: np.ndarray,
+    ) -> np.ndarray:
+        """Optimize monthly rules over level, current inflow and the available forecast."""
+        stage_benefits = self._stage_benefits()
+        values = np.zeros((self.months_per_year, len(self.levels), *forecast_probs.shape[1:]))
+        decisions = np.empty_like(values)
+        year = 0
+
+        while True:
+            year += 1
+            for month in range(self.months_per_year - 1, -1, -1):
+                next_month = (month + 1) % self.months_per_year
+                # The next decision gets its own forecast after the next inflow becomes known.
+                next_values = np.sum(values[next_month] * forecast_probs[next_month], axis=2)
+                future_values = np.einsum("ln,cfn->lcf", next_values, transitions[month])
+                action_values = stage_benefits[month, :, :, :, None] + future_values[None, :, :, :]
+                best_targets = np.argmax(action_values, axis=1)
+                decisions[month] = self.levels[best_targets]
+                values[month] = np.take_along_axis(action_values, best_targets[:, None], axis=1)[:, 0]
+
+            # Center the relative value function once per annual sweep.
+            values -= values[0, 0, 0, 0]
+            converged, max_difference = self._check_convergence(decisions)
+            print(f"SDP iteration year {year}, maximum decision change: {max_difference:.6f} m")
+            if converged:
+                return decisions
+            self.history["prev_decisions"] = decisions.copy()
 
     def optimize(self):
         """

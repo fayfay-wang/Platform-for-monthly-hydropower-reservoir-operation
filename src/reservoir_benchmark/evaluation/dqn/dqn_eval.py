@@ -25,6 +25,11 @@ from reservoir_benchmark.policy_generation.dqn.dqn_agent import (
     DQNAgent,
     set_global_seed,
 )
+from reservoir_benchmark.shared.inflow_forecast import (
+    ForecastScenario,
+    forecast_evaluation_dir,
+    load_forecast_penalty_candidates,
+)
 from reservoir_benchmark.shared.io_utils import load_penalty_candidates
 from reservoir_benchmark.shared.project_paths import (
     format_lambda_for_filename,
@@ -82,6 +87,8 @@ class ReservoirEvaluator:
         self.detailed_records = []
 
         self.env.max_steps = num_years * 12
+        if self.env.forecast is not None and end_year == len(self.env.test_data) - 1:
+            self.env.max_steps -= 1
 
         for episode in range(num_episodes):
             print(f"Evaluation episode {episode + 1}/{num_episodes}")
@@ -268,16 +275,27 @@ def aggregate_seed_results(input_files, output_file):
     print(f"Multi-seed mean result saved to:\n{output_file}")
 
 
-def run_evaluation():
+def run_evaluation(
+    forecast: ForecastScenario | None = None,
+    policy_forecast: ForecastScenario | None = None,
+):
     """
     Evaluate all trained DQN models defined by dqn.candidates.
     """
-    data_dir = get_data_dir()
-    penalty_settings_path = data_dir / "penalty_settings.yaml"
-    lam_list = load_penalty_candidates(penalty_settings_path, "dqn")
-
     model_dir = get_policy_generation_dir("dqn") / "policy"
-    eval_output_dir = get_outputs_dir() / "evaluation" / "dqn"
+    if forecast is None:
+        penalty_settings_path = get_data_dir() / "penalty_settings.yaml"
+        lam_list = load_penalty_candidates(penalty_settings_path, "dqn")
+    else:
+        policy_forecast = policy_forecast or forecast
+        if (forecast.mode == "none") != (policy_forecast.mode == "none"):
+            raise ValueError("DQN policy and evaluation must use the same observation dimensions.")
+        lam_list = load_forecast_penalty_candidates("dqn")
+        model_dir /= policy_forecast.name
+
+    eval_output_dir = forecast_evaluation_dir(
+        get_outputs_dir() / "evaluation" / "dqn", forecast, policy_forecast
+    )
     by_seed_dir = eval_output_dir / "by_seed"
     eval_output_dir.mkdir(parents=True, exist_ok=True)
     by_seed_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +311,8 @@ def run_evaluation():
             model_path = model_dir / f"dqn_train_lambda_{lam_str}_seed_{seed}.pth"
 
             if not model_path.exists():
+                if forecast is not None:
+                    raise FileNotFoundError(f"DQN model not found: {model_path}")
                 print(f"Model not found: {model_path}, skipping seed {seed}")
                 continue
 
@@ -308,8 +328,7 @@ def run_evaluation():
             set_global_seed(seed)
 
             basic_info = BasicInfo(config)
-            env = ReservoirEnv(basic_info)
-            env.is_training = False
+            env = ReservoirEnv(basic_info, forecast=forecast, is_training=False)
 
             agent = DQNAgent(
                 n_actions=env.action_space.n,
@@ -334,6 +353,8 @@ def run_evaluation():
 
             if success and seed_output_path.exists():
                 seed_result_files.append(seed_output_path)
+            elif forecast is not None:
+                raise RuntimeError(f"DQN evaluation failed for model: {model_path}")
             else:
                 print(f"Skip seed={seed}: evaluation failed or output file missing")
 
@@ -350,8 +371,11 @@ def run_evaluation():
 
 
 
-def main_dqn_eval() -> None:
-    run_evaluation()
+def main_dqn_eval(
+    forecast: ForecastScenario | None = None,
+    policy_forecast: ForecastScenario | None = None,
+) -> None:
+    run_evaluation(forecast, policy_forecast)
 
 
 if __name__ == "__main__":

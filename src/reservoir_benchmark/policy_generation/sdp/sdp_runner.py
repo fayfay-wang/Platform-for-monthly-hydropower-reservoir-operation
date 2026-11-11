@@ -19,12 +19,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from reservoir_benchmark.policy_generation.sdp.sdp_preprocessor import SDPInflowDiscretizer
+from reservoir_benchmark.policy_generation.sdp.sdp_preprocessor import (
+    SDPInflowDiscretizer,
+    estimate_inflow_transitions,
+)
 from reservoir_benchmark.policy_generation.sdp.sdp_solver import ReservoirOperation
+from reservoir_benchmark.shared.inflow_forecast import (
+    ForecastScenario,
+    load_forecast_penalty_candidates,
+)
 from reservoir_benchmark.shared.io_utils import (
     load_algorithm_settings,
+    load_monthly_inflows_from_excel,
     load_penalty_candidates,
     load_sdp_inflow_intervals,
     require_keys,
@@ -92,7 +101,35 @@ def export_operation_rules(
     return filepath
 
 
-def main_sdp() -> None:
+def _export_forecast_rules(
+    decisions: np.ndarray,
+    levels: np.ndarray,
+    inflow_bounds: np.ndarray,
+    forecast_bounds: np.ndarray | None,
+    output_dir: Path,
+    lam: float,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filepath = output_dir / f"sdp_train_lambda_{format_lambda_for_filename(lam)}.xlsx"
+
+    with pd.ExcelWriter(filepath) as writer:
+        for month in range(12):
+            index = pd.MultiIndex.from_product(
+                [levels, inflow_bounds[month]],
+                names=["Water level (m)", "Current inflow upper bound (m³/s)"],
+            )
+            if forecast_bounds is None:
+                columns = ["Target water level (m)"]
+            else:
+                columns = forecast_bounds[month]
+            rule_df = pd.DataFrame(decisions[month].reshape(-1, len(columns)), index=index, columns=columns)
+            rule_df.to_excel(writer, sheet_name=f"{month + 1}月", merge_cells=False)
+
+    print(f"Operation rule table saved to: {filepath}")
+    return filepath
+
+
+def main_sdp(forecast: ForecastScenario | None = None) -> None:
     """
     Main entry point for SDP training.
     """
@@ -112,6 +149,23 @@ def main_sdp() -> None:
 
     n_inflow_discrete = int(sdp_settings["n_inflow_classes"])
     threshold = float(sdp_settings["threshold"])
+
+    if forecast is not None:
+        train_inflows = load_monthly_inflows_from_excel(train_inflow_file).to_numpy(dtype=float)
+        inflows, inflow_bounds, forecast_bounds, transitions, forecast_probs = estimate_inflow_transitions(
+            train_inflows, n_inflow_discrete, forecast
+        )
+        reservoir_model = SharedReservoirModel(data_dir=data_dir)
+        for lam in load_forecast_penalty_candidates("sdp"):
+            print(f"\nTraining SDP for {forecast.name}, lambda = {lam}")
+            solver = ReservoirOperation(reservoir=reservoir_model, inflows=inflows)
+            solver.config["threshold"] = threshold
+            solver.config["firm_power_penalty_lambda"] = lam
+            decisions = solver.optimize_with_forecast(transitions, forecast_probs)
+            _export_forecast_rules(
+                decisions, solver.levels, inflow_bounds, forecast_bounds, output_dir / forecast.name, lam
+            )
+        return
 
     # Step 1: generate SDP inflow discretization file automatically
     discretizer = SDPInflowDiscretizer(

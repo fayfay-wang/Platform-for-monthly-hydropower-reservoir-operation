@@ -19,6 +19,7 @@ requiring a separate preprocessing script.
 import numpy as np
 import pandas as pd
 
+from reservoir_benchmark.shared.inflow_forecast import ForecastScenario
 from reservoir_benchmark.shared.io_utils import load_monthly_inflows_from_excel
 from reservoir_benchmark.shared.project_paths import (
     get_data_dir,
@@ -151,3 +152,49 @@ class SDPInflowDiscretizer:
             return 1
 
         return self.n_inflow_classes
+
+
+def estimate_inflow_transitions(
+    inflows: np.ndarray,
+    n_flows: int,
+    forecast: ForecastScenario,
+):
+    """Fit seasonal inflow transitions and forecast probabilities on training data."""
+    quantiles = np.arange(1, n_flows + 1) / n_flows
+    inflow_bounds = np.quantile(inflows, quantiles, axis=0).T
+    representative_inflows = np.quantile(inflows, quantiles - 0.5 / n_flows, axis=0).T
+    inflow_classes = np.empty(inflows.shape, dtype=int)
+    for month, bounds in enumerate(inflow_bounds):
+        inflow_classes[:, month] = np.searchsorted(bounds[:-1], inflows[:, month], side="right")
+
+    months = np.arange(inflows.size - 1) % 12
+    current_classes = inflow_classes.ravel()[:-1]
+    next_classes = inflow_classes.ravel()[1:]
+    # A total of one uniform pseudo-observation per row regularizes sparse classes.
+    transitions = np.full((12, n_flows, n_flows), 1.0 / n_flows)
+    np.add.at(transitions, (months, current_classes, next_classes), 1)
+    transitions /= transitions.sum(axis=2, keepdims=True)
+
+    if forecast.mode == "none":
+        return representative_inflows, inflow_bounds, None, transitions[:, :, None, :], np.ones((12, n_flows, 1))
+
+    forecast_bounds = np.roll(inflow_bounds, -1, axis=0)
+    likelihoods = np.broadcast_to(np.eye(n_flows), transitions.shape)
+    if forecast.mode == "noisy":
+        # Draw repeatedly for each training pair to estimate P(forecast class | next inflow class).
+        actual_next = inflows.ravel()[1:]
+        signals = forecast.observe(np.broadcast_to(actual_next, (16, len(actual_next))), forecast.training_seed)
+        likelihoods = np.full_like(transitions, 1.0 / n_flows)
+        for month in range(12):
+            in_month = months == month
+            month_signals = signals[:, in_month]
+            bounds = np.quantile(month_signals, quantiles)
+            forecast_bounds[month] = bounds
+            signal_classes = np.searchsorted(bounds[:-1], month_signals, side="right")
+            np.add.at(likelihoods[month], (next_classes[in_month], signal_classes), 1)
+        likelihoods /= likelihoods.sum(axis=2, keepdims=True)
+
+    joint_probs = transitions[:, :, :, None] * likelihoods[:, None, :, :]
+    forecast_probs = joint_probs.sum(axis=2)
+    conditioned_transitions = joint_probs.transpose(0, 1, 3, 2) / forecast_probs[:, :, :, None]
+    return representative_inflows, inflow_bounds, forecast_bounds, conditioned_transitions, forecast_probs

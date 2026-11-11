@@ -21,6 +21,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium.spaces import Box as GBox, Discrete as GDiscrete
 
+from reservoir_benchmark.shared.inflow_forecast import ForecastScenario
 from reservoir_benchmark.shared.reservoir_model import SharedReservoirModel
 
 
@@ -57,6 +58,7 @@ class ReservoirEnv(gym.Env):
 
     State definition:
         [storage (1e9 m3), inflow (m3/s), month]
+        Perfect and noisy scenarios append the observed next-month inflow (m3/s).
 
     Action definition:
         Discrete target end-of-month storage candidates.
@@ -64,7 +66,14 @@ class ReservoirEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, basic_info, debug: bool = False,):
+    def __init__(
+        self,
+        basic_info,
+        debug: bool = False,
+        *,
+        forecast: ForecastScenario | None = None,
+        is_training: bool = True,
+    ):
         super().__init__()
 
         self.debug = debug
@@ -98,19 +107,28 @@ class ReservoirEnv(gym.Env):
         self.dead_storage = float(self.basic_info.dead_storage)
         self.normal_storage = float(self.basic_info.normal_storage)
 
-        # Observation space: [storage, inflow, month]
-        self.observation_space = GBox(
-            low=np.array([self.dead_storage, 0.0, 1.0], dtype=np.float32),
-            high=np.array(
-                [self.normal_storage, self.inflow_upper_bound, 12.0],
-                dtype=np.float32,
-            ),
-            dtype=np.float32,
-        )
-
         # Inflow data
         self.train_data = self.basic_info.train_inflow
         self.test_data = self.basic_info.test_inflow
+        self.is_training = is_training
+        self.forecast = forecast
+        self.forecast_inflows = None
+        if forecast is not None and forecast.mode != "none":
+            data = self.train_data if is_training else self.test_data
+            seed = forecast.training_seed if is_training else forecast.evaluation_seed
+            self.forecast_inflows = forecast.next_month(data.to_numpy(), seed)
+
+        # Observation space: [storage, inflow, month, optional next inflow]
+        low = [self.dead_storage, 0.0, 1.0]
+        high = [self.normal_storage, self.inflow_upper_bound, 12.0]
+        if self.forecast_inflows is not None:
+            low.append(0.0)
+            high.append(np.inf)
+        self.observation_space = GBox(
+            low=np.array(low, dtype=np.float32),
+            high=np.array(high, dtype=np.float32),
+            dtype=np.float32,
+        )
 
         # Monthly inflow columns in SynMonthlyInflow_train.xlsx and SynMonthlyInflow_evaluation.xlsx
         self.month_columns = [
@@ -121,7 +139,6 @@ class ReservoirEnv(gym.Env):
         # Running state
         self.current_step = 0
         self.current_year_index = 0
-        self.is_training = True
         self.current_month = 1
         self.state = None
 
@@ -146,15 +163,19 @@ class ReservoirEnv(gym.Env):
         data = self.train_data if self.is_training else self.test_data
         max_years = len(data)
         self.current_year_index = max(0, min(self.current_year_index, max_years - 1))
+        if (
+            self.forecast is not None
+            and self.is_training
+            and self.current_year_index == max_years - 1
+            and self.current_month == 12
+        ):
+            self.current_year_index = 0
 
         initial_inflow = float(data.iloc[self.current_year_index][self.month_columns[0]])
         initial_storage = self.normal_storage
 
         self.current_month = 1
-        self.state = np.array(
-            [initial_storage, initial_inflow, self.current_month],
-            dtype=np.float32,
-        )
+        self.state = self._make_observation(initial_storage, initial_inflow)
         self.current_step = 0
 
         self.yearly_electricity = 0.0
@@ -170,7 +191,7 @@ class ReservoirEnv(gym.Env):
         action = int(action)
         action = np.clip(action, 0, len(self.basic_info.state_present_storage) - 1)
 
-        current_storage, current_inflow, _ = self.state
+        current_storage, current_inflow = self.state[:2]
         current_storage = float(current_storage)
         current_inflow = float(current_inflow)
 
@@ -238,16 +259,33 @@ class ReservoirEnv(gym.Env):
             self.monthly_electricity_in_year = []
 
         self.current_month = next_month
-        self.state = np.array(
-            [next_storage, next_inflow, self.current_month],
-            dtype=np.float32,
-        )
+        self.state = self._make_observation(next_storage, next_inflow)
 
         self.current_step += 1
-        terminated = self.current_step >= self.max_steps
-        truncated = False
+        # The final month has no following inflow within the training record.
+        end_of_training_data = (
+            self.forecast is not None
+            and self.is_training
+            and self.current_year_index == len(self.train_data) - 1
+            and self.current_month == 12
+        )
+        reached_step_limit = self.current_step >= self.max_steps
+        terminated = end_of_training_data or (self.forecast is None and reached_step_limit)
+        truncated = reached_step_limit and not terminated
 
         return self.state, reward, terminated, truncated, info
+
+    def _make_observation(self, storage: float, inflow: float) -> np.ndarray:
+        observation = [storage, inflow, self.current_month]
+        if self.forecast_inflows is not None:
+            year = self.current_year_index
+            next_inflow = (
+                self.forecast_inflows[year, self.current_month - 1]
+                if year < len(self.forecast_inflows)
+                else 0.0
+            )
+            observation.append(next_inflow)
+        return np.array(observation, dtype=np.float32)
 
     def _get_next_inflow(self) -> float:
         """

@@ -11,13 +11,35 @@ The purpose of this script is to keep executable evaluation workflows separate
 from reusable library modules.
 """
 
+import argparse
+from dataclasses import replace
+
 from reservoir_benchmark.evaluation.ddp.ddp_eval import main_ddp_eval
 from reservoir_benchmark.evaluation.sdp.sdp_eval import main_sdp_eval
 from reservoir_benchmark.evaluation.iso_surf.iso_surf_eval import main_iso_surf_eval
 from reservoir_benchmark.evaluation.dqn.dqn_eval import main_dqn_eval
+from reservoir_benchmark.shared.inflow_forecast import (
+    load_forecast_evaluation_seeds,
+    load_forecast_scenarios,
+)
 
 
-def main() -> None:
+def main(forecast_sensitivity: bool = False) -> None:
+    if forecast_sensitivity:
+        scenarios = load_forecast_scenarios()
+        perfect = scenarios[0]
+        evaluation_seeds = load_forecast_evaluation_seeds()
+        for forecast in scenarios:
+            for evaluate in (main_sdp_eval, main_iso_surf_eval, main_dqn_eval):
+                if forecast.mode == "noisy":
+                    for seed in evaluation_seeds:
+                        observed = replace(forecast, evaluation_seed=seed)
+                        evaluate(forecast=observed)
+                        evaluate(forecast=observed, policy_forecast=perfect)
+                else:
+                    evaluate(forecast=forecast)
+        return
+
     try:
         # print("=" * 80)
         # print("Running DDP evaluation...")
@@ -51,4 +73,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate reservoir operation policies.")
+    parser.add_argument("--forecast-sensitivity", action="store_true")
+    main(forecast_sensitivity=parser.parse_args().forecast_sensitivity)
