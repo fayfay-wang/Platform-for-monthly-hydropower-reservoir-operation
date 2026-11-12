@@ -120,7 +120,7 @@ def run_training(
 
     model_output_dir = get_policy_generation_dir("dqn") / "policy"
     if forecast is not None:
-        model_output_dir /= forecast.name
+        model_output_dir = model_output_dir / "current_month" / forecast.name
     model_output_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_output_dir / f"dqn_train_lambda_{lam_str}_seed_{seed}.pth"
 

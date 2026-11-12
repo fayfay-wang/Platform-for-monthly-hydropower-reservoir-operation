@@ -87,8 +87,6 @@ class ReservoirEvaluator:
         self.detailed_records = []
 
         self.env.max_steps = num_years * 12
-        if self.env.forecast is not None and end_year == len(self.env.test_data) - 1:
-            self.env.max_steps -= 1
 
         for episode in range(num_episodes):
             print(f"Evaluation episode {episode + 1}/{num_episodes}")
@@ -123,7 +121,7 @@ class ReservoirEvaluator:
             "Calendar_Month": 0,
             "Start_Water_Level_m": initial_level,
             "Start_Storage_1e9_m3": initial_storage,
-            "Inflow_m3s": float(observation[1]),
+            "Inflow_m3s": float(observation[1]) if self.env.forecast is None else 0.0,
             "Action": None,
             "Target_Storage_1e9_m3": None,
             "Total_Discharge_m3s": 0.0,
@@ -291,7 +289,7 @@ def run_evaluation(
         if (forecast.mode == "none") != (policy_forecast.mode == "none"):
             raise ValueError("DQN policy and evaluation must use the same observation dimensions.")
         lam_list = load_forecast_penalty_candidates("dqn")
-        model_dir /= policy_forecast.name
+        model_dir = model_dir / "current_month" / policy_forecast.name
 
     eval_output_dir = forecast_evaluation_dir(
         get_outputs_dir() / "evaluation" / "dqn", forecast, policy_forecast

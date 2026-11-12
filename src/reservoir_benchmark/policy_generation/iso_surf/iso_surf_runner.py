@@ -4,7 +4,7 @@ operation framework.
 
 This module fits monthly ISO-SURF rule surfaces from upstream DP training
 trajectories and persists the fitted policy as a PKL artifact, including:
-1) preparing month-wise training pairs with optional next-month forecasts,
+1) preparing month-wise training pairs with optional current-month forecasts,
 2) fitting monthly spline surfaces with health checks,
 3) falling back to linear planes when spline fitting is unstable,
 4) predicting next-period water levels from the fitted rule surface, and
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import SmoothBivariateSpline
+from scipy.interpolate import SmoothBivariateSpline, UnivariateSpline
 
 from reservoir_benchmark.policy_generation.iso_surf.iso_preprocessor import ISOPreprocessor
 from reservoir_benchmark.shared.inflow_forecast import (
@@ -86,23 +86,26 @@ class ISOSurfPolicyFitter:
             # Preserve the original training-pair convention for legacy policies.
             df["Next_Level_m"] = df["Water_Level_m"].shift(-1)
             df = df.iloc[:-1, :].copy()
+            df["Policy_Inflow_m3s"] = df["Inflow_m3s"]
         else:
             # The DP table stores end-of-month levels. Match each decision to
-            # its start level, current inflow, and optional next-month forecast.
+            # its start level and any forecast available at the start of the month.
             df["Next_Level_m"] = df["Water_Level_m"]
             df["Water_Level_m"] = df["Water_Level_m"].shift(1)
-            next_inflows = forecast.next_month(df["Inflow_m3s"].to_numpy(), forecast.training_seed)
-            if next_inflows is not None:
-                df["Next_Inflow_Forecast_m3s"] = next_inflows
-            # Give all sensitivity fits the same rows with known boundary states and inflows.
-            df = df.iloc[1:-1, :].copy()
+            forecasts = forecast.current_month(df["Inflow_m3s"].to_numpy(), forecast.training_seed)
+            if forecasts is not None:
+                df["Policy_Inflow_m3s"] = forecasts
+            df = df.iloc[1:, :].copy()
 
         # Convert the continuous month index in the DP trajectory into a month-of-year
         # label in the range 1-12, so each month can be fitted independently.
         df["MonthOfYear"] = ((df["Month"] - 1) % 12) + 1
 
         # Remove any incomplete rows before fitting.
-        df = df.dropna(subset=["Water_Level_m", "Inflow_m3s", "Next_Level_m"])
+        required_inputs = ["Water_Level_m", "Next_Level_m"]
+        if "Policy_Inflow_m3s" in df:
+            required_inputs.append("Policy_Inflow_m3s")
+        df = df.dropna(subset=required_inputs)
         return df
 
     def fit_from_dp_dataframe(
@@ -112,28 +115,47 @@ class ISOSurfPolicyFitter:
         Fit month-wise ISO-SURF rule surfaces from a DP monthly trajectory DataFrame.
         """
         df = self._prepare_dataframe(dp_df, forecast)
-        if "Next_Inflow_Forecast_m3s" in df and not df.empty:
-            # Fit the original bivariate surface within each monthly forecast band.
-            forecast_by_month = df.groupby("MonthOfYear")["Next_Inflow_Forecast_m3s"]
-            lower = forecast_by_month.transform("quantile", q=1 / 3)
-            upper = forecast_by_month.transform("quantile", q=2 / 3)
-            observed = df["Next_Inflow_Forecast_m3s"]
-            forecast_bands = observed.ge(lower).astype(int) + observed.ge(upper).astype(int)
-
-            self.month_models = {}
-            for _, band in df.groupby(forecast_bands):
-                surfaces = self._fit_month_models(band)
-                medians = band.groupby("MonthOfYear")["Next_Inflow_Forecast_m3s"].median()
-                for month, median in medians.items():
-                    model = self.month_models.setdefault(
-                        month, {"mode": "forecast", "centers": [], "surfaces": []}
-                    )
-                    model["centers"].append(float(median))
-                    model["surfaces"].append(surfaces[month])
-        else:
+        if "Policy_Inflow_m3s" in df:
             self.month_models = self._fit_month_models(df)
+        else:
+            self.month_models = {
+                month: self._fit_level_curve(samples)
+                for month, samples in df.groupby("MonthOfYear")
+            }
 
         print("ISO-SURF month models fitted for months:", sorted(self.month_models))
+
+    def _fit_level_curve(self, df_m: pd.DataFrame) -> dict:
+        """Fit a one-input monthly rule for the no-forecast case."""
+        # DP levels repeat on the discrete grid. Weight the grouped targets by
+        # their sample counts so each original training month contributes equally.
+        grouped = df_m.groupby("Water_Level_m")["Next_Level_m"].agg(["mean", "size"])
+        levels = grouped.index.to_numpy(dtype=float)
+        targets = grouped["mean"].to_numpy()
+        weights = np.sqrt(grouped["size"].to_numpy())
+        level_range = (float(levels[0]), float(levels[-1]))
+        degree = self.spline_order[0]
+
+        if len(df_m) >= self.min_samples_spline and len(levels) > degree:
+            smoothing = self.smoothing_factor if self.smoothing_factor > 0.0 else 1.0
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                try:
+                    spline = UnivariateSpline(
+                        levels, targets, w=weights, k=degree, s=smoothing * len(df_m)
+                    )
+                    return {"mode": "level_spline", "spline": spline, "S_range": level_range}
+                except (ValueError, UserWarning):
+                    pass
+
+        if len(levels) == 1:
+            intercept, slope = float(targets[0]), 0.0
+        else:
+            x = np.column_stack([np.ones_like(levels), levels])
+            (intercept, slope), *_ = np.linalg.lstsq(
+                x * weights[:, None], targets * weights, rcond=None
+            )
+        return {"mode": "level_linear", "coef": (intercept, slope), "S_range": level_range}
 
     def _fit_month_models(self, df: pd.DataFrame) -> dict[int, dict]:
 
@@ -192,8 +214,11 @@ class ISOSurfPolicyFitter:
                 continue
 
             S_t = df_m["Water_Level_m"].values
-            I_t = df_m["Inflow_m3s"].values
+            I_t = df_m["Policy_Inflow_m3s"].values
             Z = df_m["Next_Level_m"].values
+            if np.ptp(S_t) == 0.0 or np.ptp(I_t) == 0.0:
+                month_models[month] = self._fit_linear_only(df_m)
+                continue
 
             # Normalize the two input dimensions before spline fitting so that
             # water level and inflow have comparable numerical scales.
@@ -299,7 +324,7 @@ class ISOSurfPolicyFitter:
             }
 
         S_t = df_m["Water_Level_m"].values
-        I_t = df_m["Inflow_m3s"].values
+        I_t = df_m["Policy_Inflow_m3s"].values
         Z = df_m["Next_Level_m"].values
 
         # Fit a simple least-squares linear plane when spline fitting is not
@@ -316,26 +341,30 @@ class ISOSurfPolicyFitter:
         }
 
     def predict_next_level(
-        self, month: int, S_t: float, I_t: float, next_inflow_forecast: float | None = None
+        self, month: int, S_t: float, I_t: float | None = None
     ) -> float:
         """
         Predict next-period water level S_{t+1} for a given month and state.
         """
         info = self.month_models.get(month, {"mode": "identity"})
-        if info.get("mode") == "forecast":
-            if next_inflow_forecast is None:
-                raise ValueError("This ISO-SURF policy requires a next-month inflow forecast.")
-            levels = [self._predict_surface(surface, S_t, I_t) for surface in info["surfaces"]]
-            return float(np.interp(next_inflow_forecast, info["centers"], levels))
-
         return self._predict_surface(info, S_t, I_t)
 
     @staticmethod
-    def _predict_surface(info: dict, S_t: float, I_t: float) -> float:
+    def _predict_surface(info: dict, S_t: float, I_t: float | None) -> float:
         mode = info.get("mode", "spline")
 
         if mode == "identity":
             return float(S_t)
+
+        if mode in {"level_spline", "level_linear"}:
+            level = float(np.clip(S_t, *info["S_range"]))
+            if mode == "level_spline":
+                return float(info["spline"](level))
+            intercept, slope = info["coef"]
+            return float(intercept + slope * level)
+
+        if I_t is None:
+            raise ValueError("This ISO-SURF policy requires an inflow input.")
 
         if mode == "spline":
             spline = info["spline"]
@@ -365,7 +394,7 @@ class ISOSurfPolicyFitter:
         lam_str = format_lambda_for_filename(lam)
         output_dir = self.output_dir
         if forecast is not None:
-            output_dir /= forecast.name
+            output_dir = output_dir / "current_month" / forecast.name
         output_dir.mkdir(parents=True, exist_ok=True)
         policy_path = output_dir / f"iso_surf_train_lambda_{lam_str}.pkl"
 

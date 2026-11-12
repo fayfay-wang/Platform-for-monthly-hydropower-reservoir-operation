@@ -59,28 +59,17 @@ class SDPReservoirSimulator:
             with pd.ExcelFile(excel_path) as workbook:
                 for month in range(1, 13):
                     df = workbook.parse(sheet_name=f"{month}月", header=None)
-                    forecast_bounds = None
-                    if forecast is None:
+                    water_levels = np.array([float(str(level).replace("m", "")) for level in df.iloc[1:, 0]])
+                    decision_data = df.iloc[1:, 1:].to_numpy(dtype=float)
+                    inflow_bounds = None
+                    if forecast is None or forecast.mode != "none":
                         inflow_bounds = df.iloc[0, 1:].to_numpy(dtype=float)
-                        water_levels = np.array([float(str(level).replace("m", "")) for level in df.iloc[1:, 0]])
-                        decision_data = df.iloc[1:, 1:].to_numpy(dtype=float)
-                    else:
-                        water_levels = df.iloc[1:, 0].drop_duplicates().to_numpy(dtype=float)
-                        n_inflows = (len(df) - 1) // len(water_levels)
-                        inflow_bounds = df.iloc[1:1 + n_inflows, 1].to_numpy(dtype=float)
-                        decision_data = df.iloc[1:, 2:].to_numpy(dtype=float)
-                        if forecast.mode == "none":
-                            decision_data = decision_data.reshape(len(water_levels), n_inflows)
-                        else:
-                            forecast_bounds = df.iloc[0, 2:].to_numpy(dtype=float)
-                            decision_data = decision_data.reshape(len(water_levels), n_inflows, len(forecast_bounds))
 
                     self.water_levels = water_levels
                     self.inflow_intervals[month] = inflow_bounds
                     self.tables[month] = {
                         "inflow_bounds": inflow_bounds,
                         "water_levels": water_levels,
-                        "forecast_bounds": forecast_bounds,
                         "decisions": decision_data,
                     }
 
@@ -88,23 +77,21 @@ class SDPReservoirSimulator:
             self,
             month: int,
             current_level: float,
-            current_inflow: float,
-            next_month_forecast: float | None = None,
+            current_inflow: float | None,
         ) -> float:
             """
-            Find the target water level for a given month, current level, and inflow.
+            Look up the target given the month, current level, and available inflow signal.
             """
             table = self.tables[month]
 
             inflow_bounds = table["inflow_bounds"]
 
-            # Find inflow interval index
-            if self.forecast is None and current_inflow <= inflow_bounds[0]:
-                inflow_idx = 0
-            else:
-                inflow_idx = bisect_right(inflow_bounds, current_inflow)
-                if inflow_idx >= len(inflow_bounds):
-                    inflow_idx = len(inflow_bounds) - 1
+            inflow_idx = 0
+            if inflow_bounds is not None:
+                if current_inflow is None:
+                    raise ValueError("This SDP rule requires a current-month inflow signal.")
+                if self.forecast is not None or current_inflow > inflow_bounds[0]:
+                    inflow_idx = min(bisect_right(inflow_bounds, current_inflow), len(inflow_bounds) - 1)
 
             # Find water-level row index
             water_levels = table["water_levels"]
@@ -114,14 +101,7 @@ class SDPReservoirSimulator:
 
             level_idx = max(0, min(level_idx, len(water_levels) - 1))
 
-            target_level = table["decisions"][level_idx, inflow_idx]
-            forecast_bounds = table["forecast_bounds"]
-            if forecast_bounds is not None:
-                if next_month_forecast is None:
-                    raise ValueError("This SDP rule requires a one-month-ahead inflow forecast.")
-                forecast_idx = min(bisect_right(forecast_bounds, next_month_forecast), len(forecast_bounds) - 1)
-                target_level = target_level[forecast_idx]
-            return float(target_level)
+            return float(table["decisions"][level_idx, inflow_idx])
 
         def get_info(self) -> dict:
             """
@@ -135,7 +115,8 @@ class SDPReservoirSimulator:
 
             for month in range(1, 13):
                 inflow_bounds = self.tables[month]["inflow_bounds"]
-                info[f"month_{month}_inflow_range"] = (inflow_bounds[0], inflow_bounds[-1])
+                if inflow_bounds is not None:
+                    info[f"month_{month}_inflow_range"] = (inflow_bounds[0], inflow_bounds[-1])
 
             return info
 
@@ -150,7 +131,7 @@ class SDPReservoirSimulator:
         self.policy_forecast = policy_forecast or forecast
         self.policy_dir = get_policy_generation_dir("sdp") / "policy"
         if self.policy_forecast is not None:
-            self.policy_dir /= self.policy_forecast.name
+            self.policy_dir = self.policy_dir / "current_month" / self.policy_forecast.name
         self.output_dir = forecast_evaluation_dir(
             get_outputs_dir() / "evaluation" / "sdp", forecast, self.policy_forecast
         )
@@ -203,8 +184,11 @@ class SDPReservoirSimulator:
 
         for month, monthly_inflow in enumerate(inflows[:12]):
             inflow = float(monthly_inflow)
+            decision_inflow = None if forecasts is None else float(forecasts[month])
+            if self.forecast is None:
+                decision_inflow = inflow
             target_level = self.lookup_table.find_decision_level(
-                month + 1, current_level, inflow, None if forecasts is None else forecasts[month]
+                month + 1, current_level, decision_inflow
             )
 
             current_storage = self.reservoir_model.calculate_storage(current_level)
@@ -332,7 +316,7 @@ class SDPReservoirSimulator:
         inflows = load_monthly_inflows_from_excel(self.evaluation_inflow_file).values
         forecasts = None
         if self.forecast is not None:
-            forecasts = self.forecast.next_month(inflows, self.forecast.evaluation_seed)
+            forecasts = self.forecast.current_month(inflows, self.forecast.evaluation_seed)
 
         print("Initializing SDP decision lookup table...")
         self.lookup_table = self.DecisionLookupTable(self.decision_table_path, self.policy_forecast)
@@ -342,10 +326,9 @@ class SDPReservoirSimulator:
         print(f"  Number of months: {info['months']}")
         print(f"  Water-level range: {info['water_levels_range'][0]:.0f} m - {info['water_levels_range'][1]:.0f} m")
         print(f"  Number of water-level points: {info['num_water_levels']}")
-        print(
-            f"  January inflow range: "
-            f"{info['month_1_inflow_range'][0]:.1f} - {info['month_1_inflow_range'][1]:.1f} m³/s"
-        )
+        if "month_1_inflow_range" in info:
+            lower, upper = info["month_1_inflow_range"]
+            print(f"  January inflow signal range: {lower:.1f} - {upper:.1f} m³/s")
 
         print("\nStarting evaluation simulation...\n")
         all_monthly_levels = [self.initial_level]
@@ -361,8 +344,6 @@ class SDPReservoirSimulator:
         for year in range(years):
             print(f"Simulating year {year + 1}...")
             year_inflows = inflows[year]
-            if self.forecast is not None and year == years - 1:
-                year_inflows = year_inflows[:-1]
 
             (
                 monthly_levels,

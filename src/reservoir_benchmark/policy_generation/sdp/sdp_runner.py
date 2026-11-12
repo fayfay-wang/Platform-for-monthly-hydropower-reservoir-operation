@@ -24,7 +24,7 @@ import pandas as pd
 
 from reservoir_benchmark.policy_generation.sdp.sdp_preprocessor import (
     SDPInflowDiscretizer,
-    estimate_inflow_transitions,
+    estimate_inflow_observations,
 )
 from reservoir_benchmark.policy_generation.sdp.sdp_solver import ReservoirOperation
 from reservoir_benchmark.shared.inflow_forecast import (
@@ -104,7 +104,6 @@ def export_operation_rules(
 def _export_forecast_rules(
     decisions: np.ndarray,
     levels: np.ndarray,
-    inflow_bounds: np.ndarray,
     forecast_bounds: np.ndarray | None,
     output_dir: Path,
     lam: float,
@@ -114,16 +113,13 @@ def _export_forecast_rules(
 
     with pd.ExcelWriter(filepath) as writer:
         for month in range(12):
-            index = pd.MultiIndex.from_product(
-                [levels, inflow_bounds[month]],
-                names=["Water level (m)", "Current inflow upper bound (m³/s)"],
-            )
             if forecast_bounds is None:
                 columns = ["Target water level (m)"]
             else:
                 columns = forecast_bounds[month]
-            rule_df = pd.DataFrame(decisions[month].reshape(-1, len(columns)), index=index, columns=columns)
-            rule_df.to_excel(writer, sheet_name=f"{month + 1}月", merge_cells=False)
+            index = pd.Index(levels, name="Water level (m)")
+            rule_df = pd.DataFrame(decisions[month], index=index, columns=columns)
+            rule_df.to_excel(writer, sheet_name=f"{month + 1}月")
 
     print(f"Operation rule table saved to: {filepath}")
     return filepath
@@ -152,7 +148,7 @@ def main_sdp(forecast: ForecastScenario | None = None) -> None:
 
     if forecast is not None:
         train_inflows = load_monthly_inflows_from_excel(train_inflow_file).to_numpy(dtype=float)
-        inflows, inflow_bounds, forecast_bounds, transitions, forecast_probs = estimate_inflow_transitions(
+        inflows, forecast_bounds, inflow_probs, forecast_probs = estimate_inflow_observations(
             train_inflows, n_inflow_discrete, forecast
         )
         reservoir_model = SharedReservoirModel(data_dir=data_dir)
@@ -161,9 +157,13 @@ def main_sdp(forecast: ForecastScenario | None = None) -> None:
             solver = ReservoirOperation(reservoir=reservoir_model, inflows=inflows)
             solver.config["threshold"] = threshold
             solver.config["firm_power_penalty_lambda"] = lam
-            decisions = solver.optimize_with_forecast(transitions, forecast_probs)
+            decisions = solver.optimize_with_forecast(inflow_probs, forecast_probs)
             _export_forecast_rules(
-                decisions, solver.levels, inflow_bounds, forecast_bounds, output_dir / forecast.name, lam
+                decisions,
+                solver.levels,
+                forecast_bounds,
+                output_dir / "current_month" / forecast.name,
+                lam,
             )
         return
 

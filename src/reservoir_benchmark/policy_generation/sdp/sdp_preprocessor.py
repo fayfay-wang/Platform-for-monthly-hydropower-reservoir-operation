@@ -154,12 +154,12 @@ class SDPInflowDiscretizer:
         return self.n_inflow_classes
 
 
-def estimate_inflow_transitions(
+def estimate_inflow_observations(
     inflows: np.ndarray,
     n_flows: int,
     forecast: ForecastScenario,
 ):
-    """Fit seasonal inflow transitions and forecast probabilities on training data."""
+    """Fit monthly actual-inflow probabilities conditional on the available forecast."""
     quantiles = np.arange(1, n_flows + 1) / n_flows
     inflow_bounds = np.quantile(inflows, quantiles, axis=0).T
     representative_inflows = np.quantile(inflows, quantiles - 0.5 / n_flows, axis=0).T
@@ -167,34 +167,32 @@ def estimate_inflow_transitions(
     for month, bounds in enumerate(inflow_bounds):
         inflow_classes[:, month] = np.searchsorted(bounds[:-1], inflows[:, month], side="right")
 
-    months = np.arange(inflows.size - 1) % 12
-    current_classes = inflow_classes.ravel()[:-1]
-    next_classes = inflow_classes.ravel()[1:]
-    # A total of one uniform pseudo-observation per row regularizes sparse classes.
-    transitions = np.full((12, n_flows, n_flows), 1.0 / n_flows)
-    np.add.at(transitions, (months, current_classes, next_classes), 1)
-    transitions /= transitions.sum(axis=2, keepdims=True)
+    # Use the same seasonal prior for all information scenarios.
+    monthly_probs = np.full((12, n_flows), 1.0 / n_flows)
+    for month, classes in enumerate(inflow_classes.T):
+        monthly_probs[month] += np.bincount(classes, minlength=n_flows)
+    monthly_probs /= monthly_probs.sum(axis=1, keepdims=True)
 
     if forecast.mode == "none":
-        return representative_inflows, inflow_bounds, None, transitions[:, :, None, :], np.ones((12, n_flows, 1))
+        return representative_inflows, None, monthly_probs[:, None, :], np.ones((12, 1))
+    if forecast.mode == "perfect":
+        posterior = np.broadcast_to(np.eye(n_flows), (12, n_flows, n_flows))
+        return representative_inflows, inflow_bounds, posterior, monthly_probs
 
-    forecast_bounds = np.roll(inflow_bounds, -1, axis=0)
-    likelihoods = np.broadcast_to(np.eye(n_flows), transitions.shape)
-    if forecast.mode == "noisy":
-        # Draw repeatedly for each training pair to estimate P(forecast class | next inflow class).
-        actual_next = inflows.ravel()[1:]
-        signals = forecast.observe(np.broadcast_to(actual_next, (16, len(actual_next))), forecast.training_seed)
-        likelihoods = np.full_like(transitions, 1.0 / n_flows)
-        for month in range(12):
-            in_month = months == month
-            month_signals = signals[:, in_month]
-            bounds = np.quantile(month_signals, quantiles)
-            forecast_bounds[month] = bounds
-            signal_classes = np.searchsorted(bounds[:-1], month_signals, side="right")
-            np.add.at(likelihoods[month], (next_classes[in_month], signal_classes), 1)
-        likelihoods /= likelihoods.sum(axis=2, keepdims=True)
+    # Sample the error model repeatedly to estimate P(forecast class | actual class).
+    samples = np.broadcast_to(inflows, (16, *inflows.shape))
+    signals = forecast.observe(samples, forecast.training_seed)
+    forecast_bounds = np.empty_like(inflow_bounds)
+    likelihoods = np.full((12, n_flows, n_flows), 1.0 / n_flows)
+    for month, classes in enumerate(inflow_classes.T):
+        month_signals = signals[:, :, month]
+        bounds = np.quantile(month_signals, quantiles)
+        forecast_bounds[month] = bounds
+        signal_classes = np.searchsorted(bounds[:-1], month_signals, side="right")
+        np.add.at(likelihoods[month], (classes[None, :], signal_classes), 1)
+    likelihoods /= likelihoods.sum(axis=2, keepdims=True)
 
-    joint_probs = transitions[:, :, :, None] * likelihoods[:, None, :, :]
-    forecast_probs = joint_probs.sum(axis=2)
-    conditioned_transitions = joint_probs.transpose(0, 1, 3, 2) / forecast_probs[:, :, :, None]
-    return representative_inflows, inflow_bounds, forecast_bounds, conditioned_transitions, forecast_probs
+    joint_probs = monthly_probs[:, :, None] * likelihoods
+    forecast_probs = joint_probs.sum(axis=1)
+    posterior = joint_probs.transpose(0, 2, 1) / forecast_probs[:, :, None]
+    return representative_inflows, forecast_bounds, posterior, forecast_probs

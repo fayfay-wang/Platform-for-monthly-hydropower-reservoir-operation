@@ -32,7 +32,7 @@ def main() -> None:
     )["experiment"]["seed_list"]
     firm_power = SharedReservoirModel(data_dir=data_dir).firm_power
     evaluation_dir = get_outputs_dir() / "evaluation"
-    output_dir = get_outputs_dir() / "visualization" / "forecast_sensitivity"
+    output_dir = get_outputs_dir() / "visualization" / "forecast_sensitivity" / "current_month"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     methods = {"sdp": "SDP", "iso_surf": "ISO-SURF", "dqn": "DQN"}
@@ -97,7 +97,7 @@ def main() -> None:
             ax.plot(x, frozen.loc[forecast_names, metric], "--", color=color)
             ax.scatter(no_forecast_x, matched.loc["none", metric], color=color, marker="s")
         ax.set_xticks([*x, no_forecast_x], labels)
-        ax.set_xlabel("Relative forecast error (CV)")
+        ax.set_xlabel("Operating-month inflow forecast error (CV)")
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
     axes[0].legend(frameon=False, loc="lower left", bbox_to_anchor=(0, 1), ncol=3)

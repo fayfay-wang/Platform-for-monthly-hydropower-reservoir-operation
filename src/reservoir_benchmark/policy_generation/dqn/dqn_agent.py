@@ -316,9 +316,9 @@ class DQNAgent:
 
         state_low = [basic_info.dead_storage, 0.0, 1.0]
         state_high = [basic_info.normal_storage, basic_info.inflow_upper_bound, 12.0]
-        if n_features == 4:
-            state_low.append(0.0)
-            state_high.append(basic_info.inflow_upper_bound)
+        if n_features == 2:
+            del state_low[1]
+            del state_high[1]
         self.state_low = np.array(state_low, dtype=np.float32)
         self.state_high = np.array(state_high, dtype=np.float32)
         self._norm_scale = 1.0 / (self.state_high - self.state_low + 1e-8)
@@ -332,10 +332,6 @@ class DQNAgent:
         Normalize state to [0, 1].
         """
         normalized = (state - self.state_low) * self._norm_scale
-        if self.n_features == 4:
-            # Preserve differences between forecasts above the reference inflow.
-            forecast = normalized[..., 3]
-            normalized[..., 3] = forecast / (1.0 + forecast)
         return np.clip(normalized, 0, 1)
 
     def choose_action(self, observation, env=None, evaluate=False):

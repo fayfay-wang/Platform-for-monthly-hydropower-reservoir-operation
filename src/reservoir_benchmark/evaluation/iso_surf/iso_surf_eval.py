@@ -52,7 +52,7 @@ class ISOReservoirSimulator:
         self.policy_dir = get_policy_generation_dir("iso_surf") / "policy"
         policy_forecast = policy_forecast or forecast
         if policy_forecast is not None:
-            self.policy_dir /= policy_forecast.name
+            self.policy_dir = self.policy_dir / "current_month" / policy_forecast.name
         self.output_dir = forecast_evaluation_dir(
             get_outputs_dir() / "evaluation" / "iso_surf", forecast, policy_forecast
         )
@@ -94,9 +94,11 @@ class ISOReservoirSimulator:
         for month, month_inflow in enumerate(year_inflows):
             inflow = float(month_inflow)
             month_of_year = month + 1
-            next_inflow_forecast = None if year_forecasts is None else float(year_forecasts[month])
+            policy_inflow = inflow if self.forecast is None else None
+            if year_forecasts is not None:
+                policy_inflow = float(year_forecasts[month])
 
-            target_level = policy.predict_next_level(month_of_year, current_level, inflow, next_inflow_forecast)
+            target_level = policy.predict_next_level(month_of_year, current_level, policy_inflow)
             target_level = max(self.dead_level, min(self.normal_level, target_level))
 
             current_storage = self.reservoir.calculate_storage(current_level)
@@ -184,7 +186,7 @@ class ISOReservoirSimulator:
         years = len(inflows)
         forecasts = None
         if self.forecast is not None:
-            forecasts = self.forecast.next_month(inflows, self.forecast.evaluation_seed)
+            forecasts = self.forecast.current_month(inflows, self.forecast.evaluation_seed)
 
         all_monthly_levels = [self.initial_level]
         all_monthly_energy = []
@@ -197,8 +199,6 @@ class ISOReservoirSimulator:
 
         for year in range(years):
             year_inflows = inflows[year]
-            if self.forecast is not None and year == years - 1:
-                year_inflows = year_inflows[:-1]
             year_forecasts = None if forecasts is None else forecasts[year]
 
             if year == 0:
@@ -243,9 +243,6 @@ class ISOReservoirSimulator:
         power_series = np.asarray(all_monthly_power, dtype=float)
         reliability = float(np.mean(power_series >= self.firm_power)) if len(power_series) > 0 else None
         avg_annual_energy = float(np.mean(annual_energy_list)) if len(annual_energy_list) > 0 else 0.0
-        if self.forecast is not None and n > 0:
-            avg_annual_energy = float(np.sum(all_monthly_energy) * 12 / n)
-
         return df_iso, avg_annual_energy, reliability
 
     def save_results(self, df_iso: pd.DataFrame, lam: float) -> Path:

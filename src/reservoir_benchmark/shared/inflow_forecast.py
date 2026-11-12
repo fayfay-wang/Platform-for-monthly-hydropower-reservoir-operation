@@ -1,4 +1,4 @@
-"""Shared one-month-ahead inflow scenarios for the forecast sensitivity experiment."""
+"""Shared month-start forecasts of the inflow over the operating month."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,23 +20,19 @@ class ForecastScenario:
     def name(self) -> str:
         return f"noisy_cv{self.cv}" if self.mode == "noisy" else self.mode
 
-    def observe(self, actual_next, seed: int) -> np.ndarray:
+    def observe(self, actual, seed: int) -> np.ndarray:
         """Apply a mean-one lognormal error with the configured relative CV."""
-        actual_next = np.asarray(actual_next, dtype=float)
+        actual = np.asarray(actual, dtype=float)
         if self.mode != "noisy":
-            return actual_next
+            return actual
         variance = np.log1p(self.cv ** 2)
-        errors = np.random.default_rng(seed).standard_normal(actual_next.shape)
-        return actual_next * np.exp(np.sqrt(variance) * errors - variance / 2)
+        errors = np.random.default_rng(seed).standard_normal(actual.shape)
+        return actual * np.exp(np.sqrt(variance) * errors - variance / 2)
 
-    def next_month(self, inflows, seed: int) -> np.ndarray | None:
+    def current_month(self, inflows, seed: int) -> np.ndarray | None:
         if self.mode == "none":
             return None
-        inflows = np.asarray(inflows, dtype=float)
-        flat = inflows.ravel()
-        # The final step has no next-month record and is omitted from reporting.
-        actual_next = np.concatenate((flat[1:], flat[-1:]))
-        return self.observe(actual_next, seed).reshape(inflows.shape)
+        return self.observe(inflows, seed)
 
 
 def _load_settings() -> dict:
@@ -73,7 +69,7 @@ def forecast_evaluation_dir(
 ) -> Path:
     if forecast is None:
         return base_dir
-    output_dir = base_dir / forecast.name
+    output_dir = base_dir / "current_month" / forecast.name
     if policy_forecast is not None and policy_forecast.name != forecast.name:
         output_dir /= f"policy_{policy_forecast.name}"
     if forecast.mode == "noisy":
