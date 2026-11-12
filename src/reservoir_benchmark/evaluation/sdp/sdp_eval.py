@@ -28,6 +28,7 @@ from reservoir_benchmark.shared.inflow_forecast import (
     load_forecast_penalty_candidates,
 )
 from reservoir_benchmark.shared.io_utils import (
+    load_algorithm_settings,
     load_monthly_inflows_from_excel,
     load_penalty_candidates,
 )
@@ -56,9 +57,24 @@ class SDPReservoirSimulator:
             self.water_levels = None
             self.inflow_intervals = {}
 
+            expected_columns = None
+            if forecast is not None:
+                if forecast.mode == "none":
+                    expected_columns = 1
+                else:
+                    sdp_settings = load_algorithm_settings(
+                        get_data_dir() / "experiment_settings.yaml", "sdp"
+                    )
+                    expected_columns = int(sdp_settings.get("n_forecast_classes", 5))
+
             with pd.ExcelFile(excel_path) as workbook:
                 for month in range(1, 13):
                     df = workbook.parse(sheet_name=f"{month}月", header=None)
+                    if expected_columns is not None and df.shape[1] != expected_columns + 1:
+                        raise ValueError(
+                            f"SDP rules in {excel_path} have {df.shape[1] - 1} decision columns "
+                            f"for month {month}; expected {expected_columns}. Regenerate this policy."
+                        )
                     water_levels = np.array([float(str(level).replace("m", "")) for level in df.iloc[1:, 0]])
                     decision_data = df.iloc[1:, 1:].to_numpy(dtype=float)
                     inflow_bounds = None

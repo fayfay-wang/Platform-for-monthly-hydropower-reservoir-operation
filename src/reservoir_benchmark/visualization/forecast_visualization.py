@@ -60,7 +60,8 @@ def main() -> None:
                                 "Lambda": lam,
                                 "Forecast": scenario.name,
                                 "Policy": policy.name,
-                                "Error_CV": scenario.cv if scenario.mode != "none" else None,
+                                "Target_NSE": 1.0 if scenario.mode == "perfect" else scenario.target_nse,
+                                "Relative_Error_SD": scenario.cv if scenario.mode != "none" else None,
                                 "Evaluation_Seed": seed,
                                 "DQN_Seed": training_seed,
                                 "Months": len(data),
@@ -78,12 +79,13 @@ def main() -> None:
 
     noisy_scenarios = sorted(
         (scenario for scenario in scenarios if scenario.mode == "noisy"),
-        key=lambda scenario: scenario.cv,
+        key=lambda scenario: scenario.target_nse,
+        reverse=True,
     )
     forecast_names = [perfect.name, *(scenario.name for scenario in noisy_scenarios)]
-    x = [0.0, *(scenario.cv for scenario in noisy_scenarios)]
+    x = [0.0, *(1.0 - scenario.target_nse for scenario in noisy_scenarios)]
     no_forecast_x = x[-1] + max(0.05, x[-1] * 0.3)
-    labels = ["0%", *(f"{scenario.cv:.0%}" for scenario in noisy_scenarios), "No forecast"]
+    labels = ["1.00", *(f"{scenario.target_nse:.2f}" for scenario in noisy_scenarios), "No forecast"]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), layout="constrained")
     y_labels = ["Annualized electricity (GWh)", "Firm-power reliability (%)"]
     multiple_penalties = mean.groupby("Method")["Lambda"].nunique().gt(1)
@@ -97,7 +99,7 @@ def main() -> None:
             ax.plot(x, frozen.loc[forecast_names, metric], "--", color=color)
             ax.scatter(no_forecast_x, matched.loc["none", metric], color=color, marker="s")
         ax.set_xticks([*x, no_forecast_x], labels)
-        ax.set_xlabel("Operating-month inflow forecast error (CV)")
+        ax.set_xlabel("Target forecast NSE")
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
     axes[0].legend(frameon=False, loc="lower left", bbox_to_anchor=(0, 1), ncol=3)

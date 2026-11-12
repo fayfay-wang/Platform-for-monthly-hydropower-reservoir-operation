@@ -5,7 +5,10 @@ from pathlib import Path
 
 import numpy as np
 
-from reservoir_benchmark.shared.io_utils import load_algorithm_settings
+from reservoir_benchmark.shared.io_utils import (
+    load_algorithm_settings,
+    load_monthly_inflows_from_excel,
+)
 from reservoir_benchmark.shared.project_paths import get_data_dir
 
 
@@ -15,19 +18,23 @@ class ForecastScenario:
     cv: float = 0.0
     training_seed: int = 2026
     evaluation_seed: int = 2027
+    target_nse: float | None = None
 
     @property
     def name(self) -> str:
-        return f"noisy_cv{self.cv}" if self.mode == "noisy" else self.mode
+        if self.mode != "noisy":
+            return self.mode
+        if self.target_nse is None:
+            return f"noisy_gaussian_cv{self.cv:g}"
+        return f"noisy_nse{self.target_nse:g}"
 
     def observe(self, actual, seed: int) -> np.ndarray:
-        """Apply a mean-one lognormal error with the configured relative CV."""
+        """Apply Gaussian relative error and floor forecasts at zero."""
         actual = np.asarray(actual, dtype=float)
         if self.mode != "noisy":
             return actual
-        variance = np.log1p(self.cv ** 2)
         errors = np.random.default_rng(seed).standard_normal(actual.shape)
-        return actual * np.exp(np.sqrt(variance) * errors - variance / 2)
+        return np.maximum(actual * (1.0 + self.cv * errors), 0.0)
 
     def current_month(self, inflows, seed: int) -> np.ndarray | None:
         if self.mode == "none":
@@ -44,12 +51,24 @@ def _load_settings() -> dict:
 def load_forecast_scenarios() -> list[ForecastScenario]:
     settings = _load_settings()
     training_seed = int(settings["training_seed"])
+    training_inflow = load_monthly_inflows_from_excel(
+        get_data_dir() / "SynMonthlyInflow_train.xlsx"
+    ).to_numpy(dtype=float)
+    # Yang et al. (2020), Eq. (16), with one training-only scale per target NSE.
+    relative_variance = np.sum((training_inflow - training_inflow.mean()) ** 2) / np.sum(
+        training_inflow ** 2
+    )
     return [
         ForecastScenario("perfect", training_seed=training_seed),
         ForecastScenario("none", training_seed=training_seed),
         *[
-            ForecastScenario("noisy", cv=float(cv), training_seed=training_seed)
-            for cv in settings["error_cvs"]
+            ForecastScenario(
+                "noisy",
+                cv=float(np.sqrt((1.0 - nse) * relative_variance)),
+                training_seed=training_seed,
+                target_nse=float(nse),
+            )
+            for nse in settings["target_nse"]
         ],
     ]
 

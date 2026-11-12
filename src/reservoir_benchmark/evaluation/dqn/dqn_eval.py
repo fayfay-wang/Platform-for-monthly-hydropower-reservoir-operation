@@ -333,6 +333,7 @@ def run_evaluation(
                 n_features=env.observation_space.shape[0],
                 config=config,
                 basic_info=basic_info,
+                forecast_policy=None if policy_forecast is None else policy_forecast.name,
             )
 
             evaluator = ReservoirEvaluator(env, agent, by_seed_dir)

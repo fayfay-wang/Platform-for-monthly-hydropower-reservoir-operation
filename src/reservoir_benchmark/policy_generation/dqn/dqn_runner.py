@@ -138,6 +138,7 @@ def run_training(
         config=config,
         basic_info=basic_info,
         device=device,
+        forecast_policy=None if forecast is None else forecast.name,
     )
 
     # Read the number of vectorized environments from the training config.

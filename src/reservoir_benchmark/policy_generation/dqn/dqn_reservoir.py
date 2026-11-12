@@ -57,9 +57,9 @@ class ReservoirEnv(gym.Env):
     Gymnasium environment for single-reservoir DQN operation.
 
     Observation definition:
-        [storage (1e9 m3), forecast of current-month inflow (m3/s), month]
+        [storage (1e9 m3), month, forecast of current-month inflow (m3/s)]
         The no-forecast scenario observes storage and month. The original
-        workflow supplies the realized current-month inflow in the flow slot.
+        workflow observes storage, realized current-month inflow, and month.
 
     Action definition:
         Discrete target end-of-month storage candidates.
@@ -121,9 +121,12 @@ class ReservoirEnv(gym.Env):
 
         low = [self.dead_storage, 1.0]
         high = [self.normal_storage, 12.0]
-        if forecast is None or self.forecast_inflows is not None:
+        if forecast is None:
             low.insert(1, 0.0)
-            high.insert(1, self.inflow_upper_bound if forecast is None else np.inf)
+            high.insert(1, self.inflow_upper_bound)
+        elif self.forecast_inflows is not None:
+            low.append(0.0)
+            high.append(np.inf)
         self.observation_space = GBox(
             low=np.array(low, dtype=np.float32),
             high=np.array(high, dtype=np.float32),
@@ -289,7 +292,7 @@ class ReservoirEnv(gym.Env):
                 if year < len(self.forecast_inflows)
                 else 0.0
             )
-            observation.insert(1, month_forecast)
+            observation.append(month_forecast)
         return np.array(observation, dtype=np.float32)
 
     def _get_next_inflow(self) -> float:

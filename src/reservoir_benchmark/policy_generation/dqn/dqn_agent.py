@@ -270,11 +270,22 @@ class DQNAgent:
     DQN agent with normalized states and AMP support.
     """
 
-    def __init__(self, n_actions, n_features, config: Config, basic_info: BasicInfo, device=None):
+    def __init__(
+        self,
+        n_actions,
+        n_features,
+        config: Config,
+        basic_info: BasicInfo,
+        device=None,
+        *,
+        forecast_policy: str | None = None,
+    ):
         self.config = config
         self.n_actions = n_actions
         self.n_features = n_features
         self.basic_info = basic_info
+        self.forecast_policy = forecast_policy
+        self.has_forecast_input = forecast_policy not in (None, "none")
 
         if device is None:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -314,11 +325,14 @@ class DQNAgent:
 
         self.learn_step_counter = 0
 
-        state_low = [basic_info.dead_storage, 0.0, 1.0]
-        state_high = [basic_info.normal_storage, basic_info.inflow_upper_bound, 12.0]
-        if n_features == 2:
-            del state_low[1]
-            del state_high[1]
+        state_low = [basic_info.dead_storage, 1.0]
+        state_high = [basic_info.normal_storage, 12.0]
+        if self.has_forecast_input:
+            state_low.append(0.0)
+            state_high.append(basic_info.inflow_upper_bound)
+        elif n_features == 3:
+            state_low.insert(1, 0.0)
+            state_high.insert(1, basic_info.inflow_upper_bound)
         self.state_low = np.array(state_low, dtype=np.float32)
         self.state_high = np.array(state_high, dtype=np.float32)
         self._norm_scale = 1.0 / (self.state_high - self.state_low + 1e-8)
@@ -332,6 +346,10 @@ class DQNAgent:
         Normalize state to [0, 1].
         """
         normalized = (state - self.state_low) * self._norm_scale
+        if self.has_forecast_input:
+            # Scale positive forecasts monotonically, including those above the reference inflow.
+            scaled_forecast = normalized[..., 2]
+            normalized[..., 2] = scaled_forecast / (1.0 + scaled_forecast)
         return np.clip(normalized, 0, 1)
 
     def choose_action(self, observation, env=None, evaluate=False):
@@ -417,6 +435,7 @@ class DQNAgent:
             "state_high": self.state_high,
             "device": str(self.device),
             "seed": getattr(self.config, "seed", 42),
+            "forecast_policy": self.forecast_policy,
         }
 
         torch.save(checkpoint, path)
@@ -433,6 +452,19 @@ class DQNAgent:
 
         try:
             checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+            saved_policy = checkpoint.get("forecast_policy")
+            existing_no_forecast = (
+                saved_policy is None
+                and self.forecast_policy == "none"
+                and np.array_equal(checkpoint.get("state_low"), self.state_low)
+                and np.array_equal(checkpoint.get("state_high"), self.state_high)
+            )
+            if saved_policy != self.forecast_policy and not existing_no_forecast:
+                raise ValueError(
+                    f"Expected a DQN checkpoint trained for forecast policy "
+                    f"{self.forecast_policy!r}, found {saved_policy!r}."
+                )
 
             self.eval_net.load_state_dict(checkpoint["eval_net_state_dict"])
             self.target_net.load_state_dict(checkpoint["target_net_state_dict"])

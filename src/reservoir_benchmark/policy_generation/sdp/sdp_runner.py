@@ -149,7 +149,10 @@ def main_sdp(forecast: ForecastScenario | None = None) -> None:
     if forecast is not None:
         train_inflows = load_monthly_inflows_from_excel(train_inflow_file).to_numpy(dtype=float)
         inflows, forecast_bounds, inflow_probs, forecast_probs = estimate_inflow_observations(
-            train_inflows, n_inflow_discrete, forecast
+            train_inflows,
+            n_inflow_discrete,
+            forecast,
+            n_forecast_classes=int(sdp_settings.get("n_forecast_classes", 5)),
         )
         reservoir_model = SharedReservoirModel(data_dir=data_dir)
         for lam in load_forecast_penalty_candidates("sdp"):

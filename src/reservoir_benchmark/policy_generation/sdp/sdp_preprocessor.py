@@ -158,8 +158,9 @@ def estimate_inflow_observations(
     inflows: np.ndarray,
     n_flows: int,
     forecast: ForecastScenario,
+    n_forecast_classes: int = 5,
 ):
-    """Fit monthly actual-inflow probabilities conditional on the available forecast."""
+    """Estimate monthly actual-flow and forecast probabilities from paired training data."""
     quantiles = np.arange(1, n_flows + 1) / n_flows
     inflow_bounds = np.quantile(inflows, quantiles, axis=0).T
     representative_inflows = np.quantile(inflows, quantiles - 0.5 / n_flows, axis=0).T
@@ -168,31 +169,31 @@ def estimate_inflow_observations(
         inflow_classes[:, month] = np.searchsorted(bounds[:-1], inflows[:, month], side="right")
 
     # Use the same seasonal prior for all information scenarios.
-    monthly_probs = np.full((12, n_flows), 1.0 / n_flows)
-    for month, classes in enumerate(inflow_classes.T):
-        monthly_probs[month] += np.bincount(classes, minlength=n_flows)
-    monthly_probs /= monthly_probs.sum(axis=1, keepdims=True)
+    monthly_probs = np.stack([
+        np.bincount(classes, minlength=n_flows) / len(classes)
+        for classes in inflow_classes.T
+    ])
 
     if forecast.mode == "none":
-        return representative_inflows, None, monthly_probs[:, None, :], np.ones((12, 1))
-    if forecast.mode == "perfect":
-        posterior = np.broadcast_to(np.eye(n_flows), (12, n_flows, n_flows))
-        return representative_inflows, inflow_bounds, posterior, monthly_probs
+        return representative_inflows, None, monthly_probs[:, None, :], np.ones((inflows.shape[1], 1))
 
-    # Sample the error model repeatedly to estimate P(forecast class | actual class).
-    samples = np.broadcast_to(inflows, (16, *inflows.shape))
-    signals = forecast.observe(samples, forecast.training_seed)
-    forecast_bounds = np.empty_like(inflow_bounds)
-    likelihoods = np.full((12, n_flows, n_flows), 1.0 / n_flows)
-    for month, classes in enumerate(inflow_classes.T):
-        month_signals = signals[:, :, month]
-        bounds = np.quantile(month_signals, quantiles)
-        forecast_bounds[month] = bounds
-        signal_classes = np.searchsorted(bounds[:-1], month_signals, side="right")
-        np.add.at(likelihoods[month], (classes[None, :], signal_classes), 1)
-    likelihoods /= likelihoods.sum(axis=2, keepdims=True)
+    # Fixed monthly forecast bins make the observed classes comparable across scenarios.
+    forecast_quantiles = np.arange(1, n_forecast_classes + 1) / n_forecast_classes
+    forecast_bounds = np.quantile(inflows, forecast_quantiles, axis=0).T
+    signals = forecast.current_month(inflows, forecast.training_seed)
+    joint_counts = np.zeros((inflows.shape[1], n_forecast_classes, n_flows), dtype=int)
+    for month, bounds in enumerate(forecast_bounds):
+        signal_classes = np.searchsorted(bounds[:-1], signals[:, month], side="right")
+        np.add.at(joint_counts[month], (signal_classes, inflow_classes[:, month]), 1)
 
-    joint_probs = monthly_probs[:, :, None] * likelihoods
-    forecast_probs = joint_probs.sum(axis=1)
-    posterior = joint_probs.transpose(0, 2, 1) / forecast_probs[:, :, None]
+    forecast_counts = joint_counts.sum(axis=2)
+    forecast_probs = forecast_counts / len(inflows)
+    # A forecast bin absent in training falls back to the monthly prior at lookup.
+    posterior = np.broadcast_to(monthly_probs[:, None, :], joint_counts.shape).copy()
+    np.divide(
+        joint_counts,
+        forecast_counts[:, :, None],
+        out=posterior,
+        where=forecast_counts[:, :, None] > 0,
+    )
     return representative_inflows, forecast_bounds, posterior, forecast_probs

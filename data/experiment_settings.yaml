@@ -1,6 +1,7 @@
 
 sdp:
   n_inflow_classes: 20
+  n_forecast_classes: 5
   threshold: 0.01
 
 iso_surf:
@@ -38,10 +39,10 @@ dqn:
     progress_update_freq: 10
 
 forecast_sensitivity:
-  error_cvs: [0.10, 0.25, 0.50]
+  target_nse: [0.95, 0.80, 0.40]
   training_seed: 2026
   evaluation_seeds: [2027, 2028, 2029, 2030, 2031]
   penalty_candidates:
-    sdp: [20]
-    iso_surf: [20]
-    dqn: [20]
+    sdp: [0]
+    iso_surf: [0]
+    dqn: [0]

@@ -91,15 +91,19 @@ class ISOReservoirSimulator:
 
         current_level = initial_level
 
-        for month, month_inflow in enumerate(year_inflows):
-            inflow = float(month_inflow)
+        for month in range(len(year_inflows)):
             month_of_year = month + 1
-            policy_inflow = inflow if self.forecast is None else None
             if year_forecasts is not None:
                 policy_inflow = float(year_forecasts[month])
+            elif self.forecast is None:
+                policy_inflow = float(year_inflows[month])
+            else:
+                policy_inflow = None
 
             target_level = policy.predict_next_level(month_of_year, current_level, policy_inflow)
             target_level = max(self.dead_level, min(self.normal_level, target_level))
+            # Settle the selected target against the realized inflow for this month.
+            inflow = float(year_inflows[month])
 
             current_storage = self.reservoir.calculate_storage(current_level)
             target_storage = self.reservoir.calculate_storage(target_level)
